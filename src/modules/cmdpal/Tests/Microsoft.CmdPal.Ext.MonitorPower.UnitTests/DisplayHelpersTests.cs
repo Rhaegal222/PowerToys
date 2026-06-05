@@ -1,0 +1,165 @@
+// Copyright (c) Microsoft Corporation
+// The Microsoft Corporation licenses this file to you under the MIT license.
+// See the LICENSE file in the project root for more information.
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+using MonitorPowerExtension;
+using static MonitorPowerExtension.DisplayHelpers;
+
+namespace Microsoft.CmdPal.Ext.MonitorPower.UnitTests;
+
+[TestClass]
+public class DisplayHelpersTests
+{
+    private static DisplayTargetId MakeTarget(uint adapterLow, uint targetId) =>
+        new(new LUID { LowPart = adapterLow }, targetId);
+
+    [TestMethod]
+    public void ClassifyTopology_SingleExternalDisplay_ReturnsExternal()
+    {
+        var t1 = MakeTarget(1, 1);
+        var targets = new List<DisplayTargetId> { t1 };
+        var tech = new Dictionary<DisplayTargetId, DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY>
+        {
+            [t1] = DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.HDMI,
+        };
+
+        var result = ClassifyTopology(targets, tech);
+
+        Assert.AreEqual(DISPLAYCONFIG_TOPOLOGY_ID.External, result);
+    }
+
+    [TestMethod]
+    public void ClassifyTopology_SingleInternalDisplay_ReturnsInternal()
+    {
+        var t1 = MakeTarget(1, 1);
+        var targets = new List<DisplayTargetId> { t1 };
+        var tech = new Dictionary<DisplayTargetId, DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY>
+        {
+            [t1] = DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.Internal,
+        };
+
+        var result = ClassifyTopology(targets, tech);
+
+        Assert.AreEqual(DISPLAYCONFIG_TOPOLOGY_ID.Internal, result);
+    }
+
+    [TestMethod]
+    public void ClassifyTopology_InternalAndExternalDisplay_ReturnsExtend()
+    {
+        var t1 = MakeTarget(1, 1);
+        var t2 = MakeTarget(1, 2);
+        var targets = new List<DisplayTargetId> { t1, t2 };
+        var tech = new Dictionary<DisplayTargetId, DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY>
+        {
+            [t1] = DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.Internal,
+            [t2] = DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.HDMI,
+        };
+
+        var result = ClassifyTopology(targets, tech);
+
+        Assert.AreEqual(DISPLAYCONFIG_TOPOLOGY_ID.Extend, result);
+    }
+
+    [TestMethod]
+    public void ClassifyTopology_TwoExternalDisplays_ReturnsExtend()
+    {
+        var t1 = MakeTarget(1, 1);
+        var t2 = MakeTarget(1, 2);
+        var targets = new List<DisplayTargetId> { t1, t2 };
+        var tech = new Dictionary<DisplayTargetId, DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY>
+        {
+            [t1] = DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.HDMI,
+            [t2] = DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.DisplayPortExternal,
+        };
+
+        var result = ClassifyTopology(targets, tech);
+
+        Assert.AreEqual(DISPLAYCONFIG_TOPOLOGY_ID.Extend, result);
+    }
+
+    [TestMethod]
+    public void IsInternalTechnology_InternalFlag_ReturnsTrue()
+    {
+        Assert.IsTrue(IsInternalTechnology(DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.Internal));
+    }
+
+    [TestMethod]
+    public void IsInternalTechnology_HdmiFlag_ReturnsFalse()
+    {
+        Assert.IsFalse(IsInternalTechnology(DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY.HDMI));
+    }
+
+    [TestMethod]
+    public void TryActivateDisplays_EmptyList_ReturnsFalseWithMessage()
+    {
+        var result = TryActivateDisplays(new List<DisplayTargetId>(), out var message);
+
+        Assert.IsFalse(result);
+        Assert.IsNotNull(message);
+        Assert.IsTrue(message.Length > 0);
+    }
+
+    [TestMethod]
+    public void TryActivateDisplays_NonExistentTargets_ReturnsFalseWithMessage()
+    {
+        var fakeTargets = new List<DisplayTargetId>
+        {
+            MakeTarget(0xDEADBEEF, 0xDEADBEEF),
+        };
+
+        var result = TryActivateDisplays(fakeTargets, out var message);
+
+        Assert.IsFalse(result);
+        Assert.IsNotNull(message);
+        Assert.IsTrue(message.Length > 0);
+    }
+
+    [TestMethod]
+    public void SaveNamedProfile_EmptyTargets_ReturnsErrorMessage()
+    {
+        var result = SaveNamedProfile("test-profile-empty", new List<DisplayTargetId>());
+
+        Assert.IsNotNull(result);
+        Assert.IsTrue(result.Length > 0);
+        Assert.AreNotEqual(MonitorPowerExtension.Properties.Resources.profile_saved, result);
+    }
+
+    [TestMethod]
+    public void ApplyNamedProfile_NonExistentFile_ReturnsErrorMessage()
+    {
+        var result = ApplyNamedProfile("nonexistent-profile-xyz-" + Guid.NewGuid().ToString("N") + ".json");
+
+        Assert.IsNotNull(result);
+        Assert.IsTrue(result.Length > 0);
+    }
+
+    [TestMethod]
+    public void SaveNamedProfile_ValidData_CreatesAndRetrievableProfile()
+    {
+        var profileName = "unit-test-" + Guid.NewGuid().ToString("N")[..8];
+        var targets = new List<DisplayTargetId> { MakeTarget(1, 1) };
+        string? fileToDelete = null;
+
+        try
+        {
+            var result = SaveNamedProfile(profileName, targets);
+
+            Assert.IsNotNull(result);
+            var profiles = GetSavedProfiles();
+            var entry = profiles.FirstOrDefault(p => p.Name == profileName);
+            Assert.IsNotNull(entry.FileName, $"Profile '{profileName}' not found after SaveNamedProfile");
+            fileToDelete = entry.FileName;
+        }
+        finally
+        {
+            if (fileToDelete is not null)
+            {
+                DeleteSavedProfile(fileToDelete);
+            }
+        }
+    }
+}

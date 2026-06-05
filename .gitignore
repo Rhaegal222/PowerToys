@@ -375,3 +375,14 @@ installer/*/*.wxs.bk
 vcpkg_installed/
 
 deps/vcpkg/
+
+# MonitorPower dev-only artifacts (local build scripts, generated headers)
+global.json
+build-cmdpal.cmd
+build-cmdpal-quick.cmd
+build-cmdpal.sh
+build-and-run.ps1
+build-and-run.sh
+Microsoft.CommandPalette.Extensions.h
+src/modules/cmdpal/extensionsdk/Microsoft.CommandPalette.Extensions/generate-winmd.ps1
+src/modules/cmdpal/ext/MonitorPowerExtension/Tests/

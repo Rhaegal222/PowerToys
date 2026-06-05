@@ -39,6 +39,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.PowerToys.Telemetry;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
+using MonitorPowerExtension;
 
 // To learn more about WinUI, the WinUI project structure,
 // and more about our project templates, see: http://aka.ms/winui-project-info.
@@ -97,8 +98,16 @@ public partial class App : Application, IDisposable
 
         // Connect the PT logging to the core project's logging.
         // This way, log statements from the core project will be captured by the PT logs
-        var logWrapper = new LogWrapper();
-        CoreLogger.InitializeLogger(logWrapper);
+        try
+        {
+            var logWrapper = new LogWrapper();
+            CoreLogger.InitializeLogger(logWrapper);
+        }
+        catch (Exception ex)
+        {
+            // Logger non disponibile — continuiamo comunque.
+            System.Diagnostics.Debug.WriteLine($"CoreLogger failed: {ex.Message}");
+        }
 
         // Now that CoreLogger is initialized, initialize the logger delegate in ApplicationInfoService
         appInfoService.SetLogDirectory(() => Logger.CurrentVersionLogDirectoryPath);
@@ -233,6 +242,8 @@ public partial class App : Application, IDisposable
         {
             services.AddSingleton<ICommandProvider, ActionsCommandsProvider>();
         }
+
+        services.AddSingleton<ICommandProvider, MonitorPowerCommandsProvider>();
     }
 
     private static void AddUIServices(ServiceCollection services, DispatcherQueue dispatcherQueue)
