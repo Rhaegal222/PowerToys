@@ -1,0 +1,52 @@
+<Project>
+  <!--
+    This .targets file bypasses XAML compilation by:
+    1. Removing all Page and ApplicationDefinition items (so XamlCompiler.exe never runs)
+    2. Adding pre-existing generated .g.cs /.g.i.cs files from the last successful build
+       as Compile items, so the C# code + XAML code-behind compile together.
+    3. Adding .xaml files as Content items so they are copied to the output directory
+       (the corresponding .xbf files from the last successful build are expected to already
+        exist in the output directory).
+  -->
+
+  <!-- Clear XAML items early, before the XAML compilation targets check @(Page) -->
+  <ItemGroup>
+    <Page Remove="**\*.xaml" />
+    <ApplicationDefinition Remove="**\*.xaml" />
+  </ItemGroup>
+
+  <!--
+    Re-add .xaml files as Content so they get copied to the output directory.
+    The .xbf files from the previous successful build are already in output\.
+  -->
+  <ItemGroup>
+    <Content Include="**\*.xaml" Exclude="$(DefaultItemExcludes);$(DefaultExcludesInProjectFolder)" />
+  </ItemGroup>
+
+  <!-- Include all existing generated code-behind files from the previous build -->
+  <ItemGroup>
+    <Compile Include="$(IntermediateOutputPath)App.g.cs" />
+    <Compile Include="$(IntermediateOutputPath)App.g.i.cs" />
+    <Compile Include="$(IntermediateOutputPath)MainWindow.g.cs" />
+    <Compile Include="$(IntermediateOutputPath)MainWindow.g.i.cs" />
+    <Compile Include="$(IntermediateOutputPath)ToastWindow.g.cs" />
+    <Compile Include="$(IntermediateOutputPath)ToastWindow.g.i.cs" />
+    <Compile Include="$(IntermediateOutputPath)XamlTypeInfo.g.cs" />
+    <Compile Include="$(IntermediateOutputPath)Controls\*.g.cs" />
+    <Compile Include="$(IntermediateOutputPath)Controls\*.g.i.cs" />
+    <Compile Include="$(IntermediateOutputPath)Dock\*.g.cs" />
+    <Compile Include="$(IntermediateOutputPath)Dock\*.g.i.cs" />
+    <Compile Include="$(IntermediateOutputPath)ExtViews\*.g.cs" />
+    <Compile Include="$(IntermediateOutputPath)ExtViews\*.g.i.cs" />
+    <Compile Include="$(IntermediateOutputPath)ExtViews\Controls\*.g.cs" />
+    <Compile Include="$(IntermediateOutputPath)ExtViews\Controls\*.g.i.cs" />
+    <Compile Include="$(IntermediateOutputPath)Pages\*.g.cs" />
+    <Compile Include="$(IntermediateOutputPath)Pages\*.g.i.cs" />
+    <Compile Include="$(IntermediateOutputPath)Settings\*.g.cs" />
+    <Compile Include="$(IntermediateOutputPath)Settings\*.g.i.cs" />
+    <Compile Include="$(IntermediateOutputPath)Styles\*.g.cs" />
+    <Compile Include="$(IntermediateOutputPath)Styles\*.g.i.cs" />
+    <Compile Include="$(IntermediateOutputPath)Controls\ShortcutControl\*.g.cs" />
+    <Compile Include="$(IntermediateOutputPath)Controls\ShortcutControl\*.g.i.cs" />
+  </ItemGroup>
+</Project>

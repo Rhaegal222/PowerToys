@@ -353,4 +353,6 @@
     <DefineConstants>$(DefineConstants);BUILD_INFO_CIBUILD</DefineConstants>
   </PropertyGroup>
 
+  
+  <Import Project="SkipXamlBuild.targets" Condition="'$(SkipXamlBuild)'=='true'" />
 </Project>

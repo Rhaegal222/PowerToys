@@ -200,8 +200,10 @@ internal sealed class RunHistoryService : IRunHistoryService
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         internal static extern nint LoadLibraryExW(string lpLibFileName, nint hFile, uint dwFlags);
 
+#pragma warning disable CA2101
         [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true, ExactSpelling = true)]
-        internal static extern nint GetProcAddress(nint hModule, [MarshalAs(UnmanagedType.LPStr)] string lpProcName);
+        internal static extern nint GetProcAddress(nint hModule, string lpProcName);
+#pragma warning restore CA2101
 
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
