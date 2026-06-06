@@ -362,6 +362,7 @@ internal static partial class DisplayHelpers
     private const uint ENUM_REGISTRY_SETTINGS = 0xFFFFFFFE;
     private const uint ENUM_CURRENT_SETTINGS = 0xFFFFFFFF;
     private const int DISP_CHANGE_SUCCESSFUL = 0;
+    private const int DISP_CHANGE_BADPARAM = -5;
     private const int DM_POSITION = 0x00000020;
     private const int DM_DISPLAYORIENTATION = 0x00000080;
     private const int DM_BITSPERPEL = 0x00040000;
@@ -1294,6 +1295,12 @@ internal static partial class DisplayHelpers
         public bool IsPrimary { get; set; }
     }
 
+    internal readonly record struct DisplayNameCandidate(
+        DisplayTargetId Target,
+        string DeviceName,
+        bool IsActive,
+        uint SourceId);
+
     private sealed class SavedProfile
     {
         public string Name { get; set; } = string.Empty;
@@ -1303,16 +1310,58 @@ internal static partial class DisplayHelpers
         public List<SnapshotTarget>? Layout { get; set; }
     }
 
-    // Build a map from DisplayTargetId â†’ GDI device name by walking all paths and
-    // using the *source* id (not the target id) for GetSourceName.
+    internal static Dictionary<DisplayTargetId, string> AssignUniqueDeviceNames(
+        IEnumerable<DisplayNameCandidate> candidates)
+    {
+        var candidateGroups = candidates
+            .Where(candidate => !string.IsNullOrWhiteSpace(candidate.DeviceName))
+            .GroupBy(candidate => candidate.Target)
+            .Select(group => new
+            {
+                Target = group.Key,
+                Candidates = group
+                    .GroupBy(candidate => candidate.DeviceName, StringComparer.OrdinalIgnoreCase)
+                    .Select(deviceGroup => deviceGroup
+                        .OrderByDescending(candidate => candidate.IsActive)
+                        .ThenBy(candidate => candidate.SourceId)
+                        .First())
+                    .OrderByDescending(candidate => candidate.IsActive)
+                    .ThenBy(candidate => candidate.SourceId)
+                    .ToList(),
+            })
+            .OrderByDescending(group => group.Candidates.Any(candidate => candidate.IsActive))
+            .ThenBy(group => group.Candidates.Count)
+            .ThenBy(group => group.Target)
+            .ToList();
+
+        var map = new Dictionary<DisplayTargetId, string>();
+        var assignedDeviceNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var group in candidateGroups)
+        {
+            var candidate = group.Candidates.FirstOrDefault(
+                item => !assignedDeviceNames.Contains(item.DeviceName));
+            if (string.IsNullOrEmpty(candidate.DeviceName))
+            {
+                continue;
+            }
+
+            map[group.Target] = candidate.DeviceName;
+            assignedDeviceNames.Add(candidate.DeviceName);
+        }
+
+        return map;
+    }
+
+    // Build a one-to-one map from DisplayTargetId to GDI device name. QDC_ALL_PATHS
+    // exposes every possible target/source pairing, so selecting the first path can
+    // incorrectly map several targets to the same \\.\DISPLAY device.
     private static Dictionary<DisplayTargetId, string> BuildTargetToDeviceNameMap()
     {
-        var map = new Dictionary<DisplayTargetId, string>();
         uint qflags = QDC_ALL_PATHS | QDC_VIRTUAL_MODE_AWARE;
         int hr = GetDisplayConfigBufferSizes(qflags, out var np, out var nm);
         if (hr != 0)
         {
-            return map;
+            return [];
         }
 
         var pa = new DISPLAYCONFIG_PATH_INFO[np];
@@ -1326,27 +1375,19 @@ internal static partial class DisplayHelpers
                     hr = QueryDisplayConfig(qflags, ref np, pp, ref nm, mm, nint.Zero);
                     if (hr != 0)
                     {
-                        return map;
+                        return [];
                     }
                 }
             }
         }
 
         Array.Resize(ref pa, (int)np);
-        var preferredPaths = pa
-            .GroupBy(p => new DisplayTargetId(p.targetInfo.adapterId, p.targetInfo.id))
-            .Select(g => g
-                .OrderByDescending(p => (p.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0)
-                .First());
-        foreach (var p in preferredPaths)
+        var candidates = new List<DisplayNameCandidate>();
+        foreach (var p in pa.Where(path => path.targetInfo.targetAvailable != 0))
         {
             var targetId = new DisplayTargetId(p.targetInfo.adapterId, p.targetInfo.id);
-            if (map.ContainsKey(targetId))
-            {
-                continue;
-            }
 
-            // GetSourceName requires the *source* id from sourceInfo â€” not the target id.
+            // GetSourceName requires the source id, not the target id.
             unsafe
             {
                 var srcName = new DISPLAYCONFIG_SOURCE_DEVICE_NAME
@@ -1366,16 +1407,17 @@ internal static partial class DisplayHelpers
                     var gdiName = srcName.GetViewGdiDeviceName();
                     if (!string.IsNullOrEmpty(gdiName))
                     {
-                        map[targetId] = gdiName;
-                        continue;
+                        candidates.Add(new DisplayNameCandidate(
+                            targetId,
+                            gdiName,
+                            (p.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0,
+                            p.sourceInfo.id));
                     }
                 }
             }
-
-            // Fallback: no usable name found for this target
         }
 
-        return map;
+        return AssignUniqueDeviceNames(candidates);
     }
 
     private static unsafe int TryActivateViaCDSE(List<DisplayTargetId>? targetsToActivate = null)
@@ -1541,14 +1583,93 @@ internal static partial class DisplayHelpers
         return layout;
     }
 
-    private static int ApplyLayout(IReadOnlyList<SnapshotTarget> layout)
+    internal static bool TryValidateLayout(
+        IReadOnlyList<SnapshotTarget> layout,
+        IReadOnlyCollection<DisplayTargetId>? expectedTargets,
+        out string validationError)
     {
+        validationError = string.Empty;
         if (layout.Count == 0)
         {
-            return DISP_CHANGE_SUCCESSFUL;
+            validationError = "The display layout is empty.";
+            return false;
+        }
+
+        if (expectedTargets != null && layout.Count != expectedTargets.Count)
+        {
+            validationError = "The layout does not contain every selected display.";
+            return false;
+        }
+
+        var targetIds = layout
+            .Select(entry => new DisplayTargetId(
+                new LUID { LowPart = entry.LowPart, HighPart = entry.HighPart },
+                entry.TargetId))
+            .ToList();
+        if (targetIds.Distinct().Count() != targetIds.Count ||
+            (expectedTargets != null && !targetIds.ToHashSet().SetEquals(expectedTargets)))
+        {
+            validationError = "The layout contains duplicate or unexpected display targets.";
+            return false;
+        }
+
+        if (layout.Any(entry =>
+            string.IsNullOrWhiteSpace(entry.DeviceName) ||
+            entry.Width <= 0 ||
+            entry.Height <= 0))
+        {
+            validationError = "The layout contains a display without a valid device name or mode.";
+            return false;
+        }
+
+        if (layout.Select(entry => entry.DeviceName).Distinct(StringComparer.OrdinalIgnoreCase).Count() != layout.Count)
+        {
+            validationError = "Multiple display targets are mapped to the same device.";
+            return false;
+        }
+
+        if (layout.Count(entry => entry.IsPrimary) != 1)
+        {
+            validationError = "The layout must contain exactly one primary display.";
+            return false;
+        }
+
+        for (int i = 0; i < layout.Count; i++)
+        {
+            var first = layout[i];
+            long firstRight = (long)first.PositionX + first.Width;
+            long firstBottom = (long)first.PositionY + first.Height;
+            for (int j = i + 1; j < layout.Count; j++)
+            {
+                var second = layout[j];
+                long secondRight = (long)second.PositionX + second.Width;
+                long secondBottom = (long)second.PositionY + second.Height;
+                bool overlaps =
+                    first.PositionX < secondRight &&
+                    firstRight > second.PositionX &&
+                    first.PositionY < secondBottom &&
+                    firstBottom > second.PositionY;
+                if (overlaps)
+                {
+                    validationError = $"Displays {first.DeviceName} and {second.DeviceName} overlap.";
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    private static int ApplyLayout(IReadOnlyList<SnapshotTarget> layout)
+    {
+        if (!TryValidateLayout(layout, null, out var validationError))
+        {
+            LogDiagnostic($"CDSE layout rejected: {validationError}");
+            return DISP_CHANGE_BADPARAM;
         }
 
         // Pass 1: Apply orientation and resolution/frequency settings
+        var result = DISP_CHANGE_SUCCESSFUL;
         foreach (var entry in layout)
         {
             if (string.IsNullOrWhiteSpace(entry.DeviceName) || entry.Width <= 0 || entry.Height <= 0)
@@ -1575,7 +1696,12 @@ internal static partial class DisplayHelpers
             {
                 Marshal.StructureToPtr(dm, dmPtr, false);
                 var flags = CDS_UPDATEREGISTRY | CDS_GLOBAL | CDS_NORESET;
-                _ = ChangeDisplaySettingsEx(entry.DeviceName, dmPtr, nint.Zero, flags, nint.Zero);
+                var applyResult = ChangeDisplaySettingsEx(entry.DeviceName, dmPtr, nint.Zero, flags, nint.Zero);
+                LogDiagnostic($"CDSE mode {entry.DeviceName} {entry.Width}x{entry.Height}@{entry.Frequency} orientation={entry.Orientation} result={applyResult}");
+                if (applyResult != DISP_CHANGE_SUCCESSFUL)
+                {
+                    result = applyResult;
+                }
             }
             finally
             {
@@ -1587,7 +1713,6 @@ internal static partial class DisplayHelpers
         Thread.Sleep(500); // Give the system a brief moment to apply the rotation
 
         // Pass 2: Apply positions
-        var result = DISP_CHANGE_SUCCESSFUL;
         foreach (var entry in layout)
         {
             if (string.IsNullOrWhiteSpace(entry.DeviceName) || entry.Width <= 0 || entry.Height <= 0)
@@ -1639,6 +1764,11 @@ internal static partial class DisplayHelpers
 
     public static string? ResolveSavedProfileFileName(string profileReference, bool referenceIsFileName)
     {
+        if (string.IsNullOrWhiteSpace(profileReference))
+        {
+            return null;
+        }
+
         if (referenceIsFileName)
         {
             // Reject any input that contains path separators to prevent directory traversal
@@ -1708,6 +1838,12 @@ internal static partial class DisplayHelpers
             Targets = targets,
             Layout = CaptureLayout(targets),
         };
+        if (!TryValidateLayout(data.Layout, targets, out var validationError))
+        {
+            LogDiagnostic($"SaveNamedProfile rejected: {validationError}");
+            return string.Format(Properties.Resources.error_format, Properties.Resources.error_profile_layout_invalid);
+        }
+
         System.IO.File.WriteAllText(path, System.Text.Json.JsonSerializer.Serialize(data));
         return Properties.Resources.profile_saved;
     }
@@ -1752,6 +1888,14 @@ internal static partial class DisplayHelpers
         if (profile == null || profile.Targets.Count == 0)
         {
             return string.Format(Properties.Resources.error_format, Properties.Resources.error_profile_empty);
+        }
+
+        if (profile.Layout != null &&
+            profile.Layout.Count > 0 &&
+            !TryValidateLayout(profile.Layout, profile.Targets, out var validationError))
+        {
+            LogDiagnostic($"ApplyNamedProfile rejected: {validationError}");
+            return string.Format(Properties.Resources.error_format, Properties.Resources.error_profile_layout_invalid);
         }
 
         var activateResult = ActivateDisplays(profile.Targets, onProgress);
@@ -1851,6 +1995,12 @@ internal static partial class DisplayHelpers
             Targets = targets,
             Layout = CaptureLayout(targets),
         };
+        if (!TryValidateLayout(data.Layout, targets, out var validationError))
+        {
+            LogDiagnostic($"OverwriteNamedProfile rejected: {validationError}");
+            return string.Format(Properties.Resources.error_format, Properties.Resources.error_profile_layout_invalid);
+        }
+
         System.IO.File.WriteAllText(path, System.Text.Json.JsonSerializer.Serialize(data));
         if (!string.Equals(path, System.IO.Path.Combine(ProfilesDir, fileName), StringComparison.OrdinalIgnoreCase))
         {

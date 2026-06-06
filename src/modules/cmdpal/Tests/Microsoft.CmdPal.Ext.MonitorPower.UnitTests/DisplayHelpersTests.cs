@@ -17,8 +17,27 @@ namespace Microsoft.CmdPal.Ext.MonitorPower.UnitTests;
 [TestClass]
 public class DisplayHelpersTests
 {
+    private static readonly string ProfilesDir = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "MonitorPowerExtension",
+        "profiles");
+
     private static DisplayTargetId MakeTarget(uint adapterLow, uint targetId) =>
         new(new LUID { LowPart = adapterLow }, targetId);
+
+    private static string WriteSyntheticProfile(string profileName)
+    {
+        Directory.CreateDirectory(ProfilesDir);
+        var fileName = profileName + ".json";
+        var path = Path.Combine(ProfilesDir, fileName);
+        File.WriteAllText(path, JsonSerializer.Serialize(new
+        {
+            Name = profileName,
+            Targets = new[] { MakeTarget(1, 1) },
+            Layout = Array.Empty<object>(),
+        }));
+        return fileName;
+    }
 
     [TestMethod]
     public void DisplayConfigPathStructs_MatchNativeLayoutSizes()
@@ -176,14 +195,11 @@ public class DisplayHelpersTests
     public void ResolveSavedProfileFileName_ProfileName_ReturnsFileName()
     {
         var profileName = "unit-test-reference-" + Guid.NewGuid().ToString("N")[..8];
-        var targets = new List<DisplayTargetId> { MakeTarget(1, 1) };
         string? fileToDelete = null;
 
         try
         {
-            SaveNamedProfile(profileName, targets);
-            var profiles = GetSavedProfiles();
-            fileToDelete = profiles.FirstOrDefault(p => p.Name == profileName).FileName;
+            fileToDelete = WriteSyntheticProfile(profileName);
 
             var result = ResolveSavedProfileFileName(profileName, referenceIsFileName: false);
 
@@ -202,14 +218,11 @@ public class DisplayHelpersTests
     public void ResolveSavedProfileFileName_FileName_ReturnsFileName()
     {
         var profileName = "unit-test-file-reference-" + Guid.NewGuid().ToString("N")[..8];
-        var targets = new List<DisplayTargetId> { MakeTarget(1, 1) };
         string? fileToDelete = null;
 
         try
         {
-            SaveNamedProfile(profileName, targets);
-            var profiles = GetSavedProfiles();
-            fileToDelete = profiles.FirstOrDefault(p => p.Name == profileName).FileName;
+            fileToDelete = WriteSyntheticProfile(profileName);
 
             var result = ResolveSavedProfileFileName(fileToDelete, referenceIsFileName: true);
 
@@ -233,37 +246,14 @@ public class DisplayHelpersTests
     }
 
     [TestMethod]
-    public void SaveNamedProfile_ValidData_CreatesAndRetrievableProfile()
+    public void SaveNamedProfile_UnconnectedTarget_RejectsInvalidLayout()
     {
         var profileName = "unit-test-" + Guid.NewGuid().ToString("N")[..8];
         var targets = new List<DisplayTargetId> { MakeTarget(1, 1) };
-        string? fileToDelete = null;
 
-        try
-        {
-            var result = SaveNamedProfile(profileName, targets);
+        var result = SaveNamedProfile(profileName, targets);
 
-            Assert.IsNotNull(result);
-            var profiles = GetSavedProfiles();
-            var entry = profiles.FirstOrDefault(p => p.Name == profileName);
-            Assert.IsNotNull(entry.FileName, $"Profile '{profileName}' not found after SaveNamedProfile");
-            fileToDelete = entry.FileName;
-
-            var profilePath = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "MonitorPowerExtension",
-                "profiles",
-                fileToDelete);
-            using var document = JsonDocument.Parse(File.ReadAllText(profilePath));
-            Assert.IsTrue(document.RootElement.TryGetProperty("Layout", out var layout));
-            Assert.AreEqual(JsonValueKind.Array, layout.ValueKind);
-        }
-        finally
-        {
-            if (fileToDelete is not null)
-            {
-                DeleteSavedProfile(fileToDelete);
-            }
-        }
+        Assert.AreNotEqual(MonitorPowerExtension.Properties.Resources.profile_saved, result);
+        Assert.IsFalse(File.Exists(Path.Combine(ProfilesDir, profileName + ".json")));
     }
 }

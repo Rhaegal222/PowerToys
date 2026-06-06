@@ -169,6 +169,9 @@
   <data name="error_profile_empty" xml:space="preserve">
     <value>Profile is empty or invalid</value>
   </data>
+  <data name="error_profile_layout_invalid" xml:space="preserve">
+    <value>The profile display layout is invalid or ambiguous</value>
+  </data>
   <data name="restore_failed_format" xml:space="preserve">
     <value>Restore failed: {0}</value>
     <comment>{0} = error details</comment>

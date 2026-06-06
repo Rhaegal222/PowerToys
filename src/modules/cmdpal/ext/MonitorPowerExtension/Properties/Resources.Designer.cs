@@ -128,6 +128,8 @@ namespace MonitorPowerExtension.Properties
 
         public static string error_profile_empty => ResourceManager.GetString("error_profile_empty", resourceCulture);
 
+        public static string error_profile_layout_invalid => ResourceManager.GetString("error_profile_layout_invalid", resourceCulture);
+
         public static string restore_failed_format => ResourceManager.GetString("restore_failed_format", resourceCulture);
 
         public static string press_esc_to_undo => ResourceManager.GetString("press_esc_to_undo", resourceCulture);
