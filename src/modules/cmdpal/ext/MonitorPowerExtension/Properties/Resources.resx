@@ -154,6 +154,9 @@
   <data name="error_no_displays_connected" xml:space="preserve">
     <value>None of the selected displays are currently connected</value>
   </data>
+  <data name="error_no_active_monitors_remaining" xml:space="preserve">
+    <value>Applying this profile would leave no active monitors. At least one selected target must already be active.</value>
+  </data>
   <data name="error_no_matching_paths" xml:space="preserve">
     <value>No matching display paths found for the selected targets</value>
   </data>

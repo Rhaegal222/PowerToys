@@ -4,8 +4,10 @@
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using MonitorPowerExtension;
 using static MonitorPowerExtension.DisplayHelpers;
@@ -100,6 +102,18 @@ public class DisplayHelpersTests
         var result = ClassifyTopology(targets, tech);
 
         Assert.AreEqual(DISPLAYCONFIG_TOPOLOGY_ID.Extend, result);
+    }
+
+    [TestMethod]
+    public void GetTopologyFlags_Extend_UsesDatabaseTopologyWithoutSuppliedFlag()
+    {
+        const uint expected = 0x00000484;
+
+        var result = GetTopologyFlags(DISPLAYCONFIG_TOPOLOGY_ID.Extend);
+
+        Assert.AreEqual(expected, result);
+        Assert.AreEqual(0u, result & 0x00000010);
+        Assert.AreEqual(0u, result & 0x00000200);
     }
 
     [TestMethod]
@@ -234,6 +248,15 @@ public class DisplayHelpersTests
             var entry = profiles.FirstOrDefault(p => p.Name == profileName);
             Assert.IsNotNull(entry.FileName, $"Profile '{profileName}' not found after SaveNamedProfile");
             fileToDelete = entry.FileName;
+
+            var profilePath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "MonitorPowerExtension",
+                "profiles",
+                fileToDelete);
+            using var document = JsonDocument.Parse(File.ReadAllText(profilePath));
+            Assert.IsTrue(document.RootElement.TryGetProperty("Layout", out var layout));
+            Assert.AreEqual(JsonValueKind.Array, layout.ValueKind);
         }
         finally
         {

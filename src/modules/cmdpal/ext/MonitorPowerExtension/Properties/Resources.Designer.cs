@@ -118,6 +118,8 @@ namespace MonitorPowerExtension.Properties
 
         public static string error_no_displays_connected => ResourceManager.GetString("error_no_displays_connected", resourceCulture);
 
+        public static string error_no_active_monitors_remaining => ResourceManager.GetString("error_no_active_monitors_remaining", resourceCulture);
+
         public static string error_no_matching_paths => ResourceManager.GetString("error_no_matching_paths", resourceCulture);
 
         public static string error_no_active_to_save => ResourceManager.GetString("error_no_active_to_save", resourceCulture);

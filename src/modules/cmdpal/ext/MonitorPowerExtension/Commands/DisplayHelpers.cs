@@ -287,10 +287,10 @@ internal static partial class DisplayHelpers
     private const uint QDC_VIRTUAL_MODE_AWARE = 0x00000010;
     private const uint SDC_APPLY = 0x00000080;
     private const uint SDC_SAVE_TO_DATABASE = 0x00000200;
-    private const uint SDC_TOPOLOGY_SUPPLIED = 0x00000010;
     private const uint SDC_USE_SUPPLIED_DISPLAY_CONFIG = 0x00000020;
     private const uint SDC_ALLOW_CHANGES = 0x00000400;
     private const uint SDC_VIRTUAL_MODE_AWARE = 0x00008000;
+    private const uint DISPLAYCONFIG_PATH_ACTIVE = 0x00000001;
 
     private static readonly object StateLock = new();
     private static (DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes)? _savedState;
@@ -356,9 +356,16 @@ internal static partial class DisplayHelpers
     private const uint CDS_UPDATEREGISTRY = 0x01;
     private const uint CDS_GLOBAL = 0x08;
     private const uint CDS_ENABLE = 0x04;
+    private const uint CDS_SET_PRIMARY = 0x10;
     private const uint CDS_NORESET = 0x10000000;
     private const uint ENUM_REGISTRY_SETTINGS = 0xFFFFFFFE;
     private const int DISP_CHANGE_SUCCESSFUL = 0;
+    private const int DM_POSITION = 0x00000020;
+    private const int DM_DISPLAYORIENTATION = 0x00000080;
+    private const int DM_BITSPERPEL = 0x00040000;
+    private const int DM_PELSWIDTH = 0x00080000;
+    private const int DM_PELSHEIGHT = 0x00100000;
+    private const int DM_DISPLAYFREQUENCY = 0x00400000;
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct DEVMODE
@@ -683,22 +690,23 @@ internal static partial class DisplayHelpers
         return (pathArray, modeInfoArray);
     }
 
-    private static unsafe string SetTopology(DISPLAYCONFIG_TOPOLOGY_ID topology)
+    // manageState: when true (default), SaveState() is called before the switch and
+    // _savedState is cleared on failure. Set to false when called from ActivateDisplays,
+    // which already saved state and must preserve it for ESC-restore and fallback steps.
+    private static unsafe string SetTopology(DISPLAYCONFIG_TOPOLOGY_ID topology, bool manageState = true)
     {
-        SaveState();
-        var flags = SDC_APPLY | SDC_SAVE_TO_DATABASE | SDC_ALLOW_CHANGES | SDC_TOPOLOGY_SUPPLIED;
-        var err = SetDisplayConfig(0, null, 0, null, flags | (uint)topology);
-        if (err != 0)
+        if (manageState)
         {
-            flags = SDC_APPLY | SDC_ALLOW_CHANGES | SDC_TOPOLOGY_SUPPLIED;
-            err = SetDisplayConfig(0, null, 0, null, flags | (uint)topology);
+            SaveState();
         }
+
+        var err = SetDisplayConfig(0, null, 0, null, GetTopologyFlags(topology));
 
         if (err == 0)
         {
             EnableEscRestore();
         }
-        else
+        else if (manageState)
         {
             _savedState = null;
         }
@@ -710,6 +718,9 @@ internal static partial class DisplayHelpers
             _ => string.Format(Properties.Resources.error_format, GetWin32ErrorMessage(err)),
         };
     }
+
+    internal static uint GetTopologyFlags(DISPLAYCONFIG_TOPOLOGY_ID topology)
+        => SDC_APPLY | SDC_ALLOW_CHANGES | (uint)topology;
 
     public static string SetExternalOnly()
     {
@@ -787,13 +798,7 @@ internal static partial class DisplayHelpers
             return string.Format(Properties.Resources.error_format, Properties.Resources.error_saved_state_no_paths);
         }
 
-        foreach (ref var path in snapshot.paths.AsSpan())
-        {
-            path.sourceInfo.modeInfoIdx = 0xFFFFFFFF;
-            path.targetInfo.modeInfoIdx = 0xFFFFFFFF;
-        }
-
-        var flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES;
+        var flags = SDC_APPLY | SDC_SAVE_TO_DATABASE | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES;
         int err;
 
         fixed (DISPLAYCONFIG_PATH_INFO* pathsPtr = snapshot.paths)
@@ -972,14 +977,33 @@ internal static partial class DisplayHelpers
             return false;
         }
 
+        // Safety check: at least one target must already be actively displaying,
+        // otherwise applying the profile risks turning off every monitor
+        // (e.g., when the chosen targets are physically disconnected or asleep).
+        var (activePaths, _) = GetActivePaths();
+        var activeTargetIds = activePaths
+            .Select(p => new DisplayTargetId(p.targetInfo.adapterId, p.targetInfo.id))
+            .ToHashSet();
+
+        if (!validTargets.Any(t => activeTargetIds.Contains(t)))
+        {
+            message = string.Format(Properties.Resources.error_format, Properties.Resources.error_no_active_monitors_remaining);
+            return false;
+        }
+
         // Proceed with activation
         message = ActivateDisplays(validTargets);
         return true;
     }
 
-    public static unsafe DISPLAYCONFIG_PATH_INFO[] GetAllPaths()
+    public static unsafe DISPLAYCONFIG_PATH_INFO[] GetAllPaths(bool virtualModeAware = true)
     {
-        uint flags = QDC_ALL_PATHS | QDC_VIRTUAL_MODE_AWARE;
+        uint flags = QDC_ALL_PATHS;
+        if (virtualModeAware)
+        {
+            flags |= QDC_VIRTUAL_MODE_AWARE;
+        }
+
         var result = GetDisplayConfigBufferSizes(flags, out var numPathArrayElements, out var numModeInfoArrayElements);
         if (result != 0)
         {
@@ -1024,7 +1048,7 @@ internal static partial class DisplayHelpers
     private static DISPLAYCONFIG_TOPOLOGY_ID ClassifyTopology(List<DisplayTargetId> targets)
     {
         // Use all paths (not just active) so profiles targeting inactive displays
-        // are classified correctly — active-only misses disconnected/off monitors.
+        // are classified correctly â€” active-only misses disconnected/off monitors.
         var techByTarget = GetAllPaths()
             .GroupBy(p => new DisplayTargetId(p.targetInfo.adapterId, p.targetInfo.id))
             .ToDictionary(g => g.Key, g => g.First().targetInfo.outputTechnology);
@@ -1052,37 +1076,41 @@ internal static partial class DisplayHelpers
             }
         }
 
-        // Exactly one external display → External
+        // Exactly one external display â†’ External
         if (selectedExternal == 1 && selectedInternal == 0)
         {
             return DISPLAYCONFIG_TOPOLOGY_ID.External;
         }
 
-        // Exactly one internal display → Internal
+        // Exactly one internal display â†’ Internal
         if (selectedInternal == 1 && selectedExternal == 0)
         {
             return DISPLAYCONFIG_TOPOLOGY_ID.Internal;
         }
 
-        // Multiple displays → Extend
+        // Multiple displays â†’ Extend
         return DISPLAYCONFIG_TOPOLOGY_ID.Extend;
     }
 
     public static string ActivateDisplays(List<DisplayTargetId> targets)
     {
         SaveState();
+        SaveSnapshot();
 
         var topology = ClassifyTopology(targets);
-        var result = SetTopology(topology);
-        if (!result.StartsWith(Properties.Resources.error_prefix, StringComparison.OrdinalIgnoreCase))
+
+        // manageState:false — SaveState() already called above; must not null _savedState on failure.
+        var result = SetTopology(topology, manageState: false);
+        if (!result.StartsWith(Properties.Resources.error_prefix, StringComparison.OrdinalIgnoreCase) &&
+            WaitForActiveTargets(targets))
         {
-            return result;
+            return string.Format(Properties.Resources.activated_displays_format, targets.Count);
         }
 
-        // Topology fallback failed — try with path array as last resort.
+        // Topology fallback failed â€” try with path array as last resort.
         // QDC_ALL_PATHS returns multiple paths per target (one per possible source),
         // so deduplicate by target and prefer active paths to avoid ERROR_INVALID_PARAMETER.
-        var allPaths = GetAllPaths();
+        var allPaths = GetAllPaths(virtualModeAware: false);
         var selectedPaths = allPaths
             .Where(p => targets.Any(t =>
                 t.AdapterId.Equals(p.targetInfo.adapterId) &&
@@ -1103,7 +1131,7 @@ internal static partial class DisplayHelpers
             selectedPaths[i].targetInfo.modeInfoIdx = 0xFFFFFFFF;
         }
 
-        var flags = SDC_APPLY | SDC_SAVE_TO_DATABASE | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_VIRTUAL_MODE_AWARE;
+        var flags = SDC_APPLY | SDC_SAVE_TO_DATABASE | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES;
         int err;
 
         unsafe
@@ -1116,7 +1144,7 @@ internal static partial class DisplayHelpers
 
         if (err != 0)
         {
-            flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_VIRTUAL_MODE_AWARE;
+            flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES;
             unsafe
             {
                 fixed (DISPLAYCONFIG_PATH_INFO* selectedPtr = selectedPaths)
@@ -1128,22 +1156,48 @@ internal static partial class DisplayHelpers
 
         if (err == 0)
         {
-            EnableEscRestore();
-            SaveSnapshot();
-            return string.Format(Properties.Resources.activated_displays_format, targets.Count);
+            if (WaitForActiveTargets(targets))
+            {
+                EnableEscRestore();
+                return string.Format(Properties.Resources.activated_displays_format, targets.Count);
+            }
         }
 
         // CDSE fallback for builds where SetDisplayConfig returns ERROR_INVALID_PARAMETER
         int cdseResult = TryActivateViaCDSE(targets);
-        if (cdseResult == DISP_CHANGE_SUCCESSFUL)
+        if (cdseResult == DISP_CHANGE_SUCCESSFUL && WaitForActiveTargets(targets))
         {
             EnableEscRestore();
-            SaveSnapshot();
             return string.Format(Properties.Resources.activated_displays_format, targets.Count);
         }
 
         _savedState = null;
         return string.Format(Properties.Resources.error_format, GetWin32ErrorMessage(err));
+    }
+
+    // maxWaitMs: total ms to wait for all monitors to report as active.
+    // Physical monitors waking from sleep/off can take 5-10 s; default 15 s.
+    private static bool WaitForActiveTargets(List<DisplayTargetId> targets, int maxWaitMs = 15000)
+    {
+        var requested = targets.ToHashSet();
+        const int pollMs = 500;
+        int elapsed = 0;
+        while (elapsed < maxWaitMs)
+        {
+            var active = GetActivePaths().paths
+                .Select(path => new DisplayTargetId(path.targetInfo.adapterId, path.targetInfo.id))
+                .ToHashSet();
+
+            if (active.SetEquals(requested))
+            {
+                return true;
+            }
+
+            Thread.Sleep(pollMs);
+            elapsed += pollMs;
+        }
+
+        return false;
     }
 
     private static readonly string ProfilesDir = System.IO.Path.Combine(
@@ -1156,6 +1210,19 @@ internal static partial class DisplayHelpers
         "MonitorPowerExtension");
 
     private static readonly string SnapshotPath = System.IO.Path.Combine(SnapshotDir, "snapshot.json");
+    private static readonly string DiagnosticsPath = System.IO.Path.Combine(SnapshotDir, "diagnostics.log");
+
+    private static void LogDiagnostic(string message)
+    {
+        try
+        {
+            Directory.CreateDirectory(SnapshotDir);
+            File.AppendAllText(DiagnosticsPath, $"{DateTime.Now:O} {message}{Environment.NewLine}");
+        }
+        catch
+        {
+        }
+    }
 
     internal static void SaveSnapshot()
     {
@@ -1194,7 +1261,7 @@ internal static partial class DisplayHelpers
         File.WriteAllText(SnapshotPath, JsonSerializer.Serialize(new { targets }));
     }
 
-    private sealed class SnapshotTarget
+    internal sealed class SnapshotTarget
     {
         public uint LowPart { get; set; }
 
@@ -1217,9 +1284,20 @@ internal static partial class DisplayHelpers
         public int Orientation { get; set; }
 
         public int BitsPerPel { get; set; }
+
+        public bool IsPrimary { get; set; }
     }
 
-    // Build a map from DisplayTargetId → GDI device name by walking all paths and
+    private sealed class SavedProfile
+    {
+        public string Name { get; set; } = string.Empty;
+
+        public List<DisplayTargetId> Targets { get; set; } = [];
+
+        public List<SnapshotTarget>? Layout { get; set; }
+    }
+
+    // Build a map from DisplayTargetId â†’ GDI device name by walking all paths and
     // using the *source* id (not the target id) for GetSourceName.
     private static Dictionary<DisplayTargetId, string> BuildTargetToDeviceNameMap()
     {
@@ -1249,7 +1327,12 @@ internal static partial class DisplayHelpers
         }
 
         Array.Resize(ref pa, (int)np);
-        foreach (var p in pa)
+        var preferredPaths = pa
+            .GroupBy(p => new DisplayTargetId(p.targetInfo.adapterId, p.targetInfo.id))
+            .Select(g => g
+                .OrderByDescending(p => (p.flags & DISPLAYCONFIG_PATH_ACTIVE) != 0)
+                .First());
+        foreach (var p in preferredPaths)
         {
             var targetId = new DisplayTargetId(p.targetInfo.adapterId, p.targetInfo.id);
             if (map.ContainsKey(targetId))
@@ -1257,7 +1340,7 @@ internal static partial class DisplayHelpers
                 continue;
             }
 
-            // GetSourceName requires the *source* id from sourceInfo — not the target id.
+            // GetSourceName requires the *source* id from sourceInfo â€” not the target id.
             unsafe
             {
                 var srcName = new DISPLAYCONFIG_SOURCE_DEVICE_NAME
@@ -1291,7 +1374,7 @@ internal static partial class DisplayHelpers
 
     private static unsafe int TryActivateViaCDSE(List<DisplayTargetId>? targetsToActivate = null)
     {
-        // Build target → GDI device name map using correct source IDs
+        // Build target â†’ GDI device name map using correct source IDs
         var targetToDevice = BuildTargetToDeviceNameMap();
         if (targetToDevice.Count == 0)
         {
@@ -1302,7 +1385,10 @@ internal static partial class DisplayHelpers
             ? new HashSet<DisplayTargetId>(targetsToActivate)
             : null;
 
-        // First, disable monitors NOT in the requested set (pass null DEVMODE)
+        var changeResult = DISP_CHANGE_SUCCESSFUL;
+        LogDiagnostic($"CDSE start targets={string.Join(",", activateSet ?? [])} map={string.Join(",", targetToDevice.Select(p => $"{p.Key}={p.Value}"))}");
+
+        // First, detach monitors not in the requested set from the desktop.
         if (activateSet != null)
         {
             foreach (var kvp in targetToDevice)
@@ -1318,8 +1404,33 @@ internal static partial class DisplayHelpers
                     continue;
                 }
 
-                // Disable this monitor by passing null DEVMODE with CDS_UPDATEREGISTRY | CDS_GLOBAL
-                _ = ChangeDisplaySettingsEx(deviceName, nint.Zero, nint.Zero, CDS_UPDATEREGISTRY | CDS_GLOBAL | CDS_NORESET, nint.Zero);
+                var disabledMode = new DEVMODE
+                {
+                    dmSize = (short)Marshal.SizeOf<DEVMODE>(),
+                    dmFields = DM_PELSWIDTH | DM_PELSHEIGHT,
+                    dmPelsWidth = 0,
+                    dmPelsHeight = 0,
+                };
+                var disabledModePtr = Marshal.AllocHGlobal(Marshal.SizeOf<DEVMODE>());
+                try
+                {
+                    Marshal.StructureToPtr(disabledMode, disabledModePtr, false);
+                    var result = ChangeDisplaySettingsEx(
+                        deviceName,
+                        disabledModePtr,
+                        nint.Zero,
+                        CDS_UPDATEREGISTRY | CDS_NORESET,
+                        nint.Zero);
+                    LogDiagnostic($"CDSE detach {kvp.Key} {deviceName} result={result}");
+                    if (result != DISP_CHANGE_SUCCESSFUL)
+                    {
+                        changeResult = result;
+                    }
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(disabledModePtr);
+                }
             }
         }
 
@@ -1340,17 +1451,10 @@ internal static partial class DisplayHelpers
             var dm = default(DEVMODE);
             dm.dmSize = (short)Marshal.SizeOf<DEVMODE>();
             int regOk = EnumDisplaySettings(deviceName, ENUM_REGISTRY_SETTINGS, ref dm);
+            LogDiagnostic($"CDSE activate {target.Key} {deviceName} enumRegistry={regOk} mode={dm.dmPelsWidth}x{dm.dmPelsHeight} fields=0x{dm.dmFields:X}");
             if (regOk == 0 || dm.dmPelsWidth == 0 || dm.dmPelsHeight == 0)
             {
-                // Try CDS_ENABLE as a last resort
-                int enableHr = ChangeDisplaySettingsEx(
-                    deviceName, nint.Zero, nint.Zero, CDS_ENABLE | CDS_NORESET, nint.Zero);
-                if (enableHr != DISP_CHANGE_SUCCESSFUL)
-                {
-                    _ = ChangeDisplaySettingsEx(
-                        deviceName, nint.Zero, nint.Zero, CDS_UPDATEREGISTRY | CDS_GLOBAL | CDS_NORESET, nint.Zero);
-                }
-
+                changeResult = -1;
                 continue;
             }
 
@@ -1361,10 +1465,16 @@ internal static partial class DisplayHelpers
             {
                 Marshal.StructureToPtr(dm, dmPtr, false);
                 int result = ChangeDisplaySettingsEx(
-                    deviceName, dmPtr, nint.Zero, CDS_UPDATEREGISTRY | CDS_GLOBAL | CDS_NORESET, nint.Zero);
+                    deviceName, dmPtr, nint.Zero, CDS_UPDATEREGISTRY | CDS_NORESET, nint.Zero);
                 if (result != DISP_CHANGE_SUCCESSFUL)
                 {
-                    _ = ChangeDisplaySettingsEx(deviceName, dmPtr, nint.Zero, CDS_GLOBAL | CDS_NORESET, nint.Zero);
+                    result = ChangeDisplaySettingsEx(deviceName, dmPtr, nint.Zero, CDS_GLOBAL | CDS_NORESET, nint.Zero);
+                }
+
+                LogDiagnostic($"CDSE activate apply {target.Key} {deviceName} result={result}");
+                if (result != DISP_CHANGE_SUCCESSFUL)
+                {
+                    changeResult = result;
                 }
             }
             finally
@@ -1374,10 +1484,118 @@ internal static partial class DisplayHelpers
         }
 
         // Commit all deferred changes at once
-        _ = ChangeDisplaySettingsEx(null!, nint.Zero, nint.Zero, 0, nint.Zero);
+        var commitResult = ChangeDisplaySettingsEx(null!, nint.Zero, nint.Zero, 0, nint.Zero);
+        LogDiagnostic($"CDSE commit result={commitResult}");
+        if (commitResult != DISP_CHANGE_SUCCESSFUL)
+        {
+            changeResult = commitResult;
+        }
 
-        SaveSnapshot();
-        return DISP_CHANGE_SUCCESSFUL;
+        return changeResult;
+    }
+
+    private static List<SnapshotTarget> CaptureLayout(IEnumerable<DisplayTargetId> targets)
+    {
+        var requested = targets.ToHashSet();
+        var deviceNameMap = BuildTargetToDeviceNameMap();
+        var layout = new List<SnapshotTarget>();
+        foreach (var id in requested)
+        {
+            if (!deviceNameMap.TryGetValue(id, out var deviceName))
+            {
+                continue;
+            }
+
+            var dm = default(DEVMODE);
+            dm.dmSize = (short)Marshal.SizeOf<DEVMODE>();
+            if (EnumDisplaySettings(deviceName, ENUM_REGISTRY_SETTINGS, ref dm) == 0 ||
+                dm.dmPelsWidth == 0 ||
+                dm.dmPelsHeight == 0)
+            {
+                continue;
+            }
+
+            layout.Add(new SnapshotTarget
+            {
+                LowPart = id.AdapterId.LowPart,
+                HighPart = id.AdapterId.HighPart,
+                TargetId = id.TargetId,
+                DeviceName = deviceName,
+                Width = dm.dmPelsWidth,
+                Height = dm.dmPelsHeight,
+                Frequency = dm.dmDisplayFrequency,
+                PositionX = dm.dmPositionX,
+                PositionY = dm.dmPositionY,
+                Orientation = dm.dmDisplayOrientation,
+                BitsPerPel = dm.dmBitsPerPel,
+                IsPrimary = dm.dmPositionX == 0 && dm.dmPositionY == 0,
+            });
+        }
+
+        return layout;
+    }
+
+    private static int ApplyLayout(IReadOnlyList<SnapshotTarget> layout)
+    {
+        if (layout.Count == 0)
+        {
+            return DISP_CHANGE_SUCCESSFUL;
+        }
+
+        var result = DISP_CHANGE_SUCCESSFUL;
+        foreach (var entry in layout)
+        {
+            if (string.IsNullOrWhiteSpace(entry.DeviceName) ||
+                entry.Width <= 0 ||
+                entry.Height <= 0)
+            {
+                result = -1;
+                continue;
+            }
+
+            var dm = default(DEVMODE);
+            dm.dmSize = (short)Marshal.SizeOf<DEVMODE>();
+            _ = EnumDisplaySettings(entry.DeviceName, ENUM_REGISTRY_SETTINGS, ref dm);
+            dm.dmFields = DM_POSITION |
+                          DM_DISPLAYORIENTATION |
+                          DM_BITSPERPEL |
+                          DM_PELSWIDTH |
+                          DM_PELSHEIGHT |
+                          DM_DISPLAYFREQUENCY;
+            dm.dmPositionX = entry.PositionX;
+            dm.dmPositionY = entry.PositionY;
+            dm.dmDisplayOrientation = entry.Orientation;
+            dm.dmBitsPerPel = entry.BitsPerPel;
+            dm.dmPelsWidth = entry.Width;
+            dm.dmPelsHeight = entry.Height;
+            dm.dmDisplayFrequency = entry.Frequency;
+
+            var dmPtr = Marshal.AllocHGlobal(Marshal.SizeOf<DEVMODE>());
+            try
+            {
+                Marshal.StructureToPtr(dm, dmPtr, false);
+                var flags = CDS_UPDATEREGISTRY | CDS_NORESET;
+                if (entry.IsPrimary)
+                {
+                    flags |= CDS_SET_PRIMARY;
+                }
+
+                var applyResult = ChangeDisplaySettingsEx(entry.DeviceName, dmPtr, nint.Zero, flags, nint.Zero);
+                LogDiagnostic($"CDSE layout {entry.DeviceName} {entry.Width}x{entry.Height}@{entry.Frequency} pos=({entry.PositionX},{entry.PositionY}) orientation={entry.Orientation} result={applyResult}");
+                if (applyResult != DISP_CHANGE_SUCCESSFUL)
+                {
+                    result = applyResult;
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(dmPtr);
+            }
+        }
+
+        var commitResult = ChangeDisplaySettingsEx(null!, nint.Zero, nint.Zero, 0, nint.Zero);
+        LogDiagnostic($"CDSE layout commit result={commitResult}");
+        return commitResult == DISP_CHANGE_SUCCESSFUL ? result : commitResult;
     }
 
     private static string SanitizeFileName(string name)
@@ -1451,9 +1669,13 @@ internal static partial class DisplayHelpers
         }
 
         var path = System.IO.Path.Combine(ProfilesDir, $"{safeName}.json");
-        var data = new { Name = name, Targets = targets };
+        var data = new SavedProfile
+        {
+            Name = name,
+            Targets = targets,
+            Layout = CaptureLayout(targets),
+        };
         System.IO.File.WriteAllText(path, System.Text.Json.JsonSerializer.Serialize(data));
-        SaveSnapshot();
         return Properties.Resources.profile_saved;
     }
 
@@ -1493,16 +1715,44 @@ internal static partial class DisplayHelpers
             return string.Format(Properties.Resources.error_format, Properties.Resources.error_profile_not_found);
         }
 
-        var json = System.IO.File.ReadAllText(path);
-        using var doc = JsonDocument.Parse(json);
-        var targetsElement = doc.RootElement.GetProperty("Targets");
-        var targets = System.Text.Json.JsonSerializer.Deserialize<List<DisplayTargetId>>(targetsElement.GetRawText());
-        if (targets == null || targets.Count == 0)
+        var profile = JsonSerializer.Deserialize<SavedProfile>(System.IO.File.ReadAllText(path));
+        if (profile == null || profile.Targets.Count == 0)
         {
             return string.Format(Properties.Resources.error_format, Properties.Resources.error_profile_empty);
         }
 
-        return ActivateDisplays(targets);
+        var activateResult = ActivateDisplays(profile.Targets);
+
+        // Always attempt ApplyLayout when a layout is available.
+        // When switching from a single-display topology (e.g. TV-only) back to
+        // multi-monitor, the topology switch may succeed but WaitForActiveTargets
+        // can time out before physical monitors finish waking. ApplyLayout sends
+        // ChangeDisplaySettingsEx to each monitor and gives Windows another chance
+        // to bring them fully online.
+        bool activateError = activateResult.StartsWith(
+            Properties.Resources.error_prefix, StringComparison.OrdinalIgnoreCase);
+
+        if (profile.Layout == null || profile.Layout.Count == 0)
+        {
+            return activateResult;
+        }
+
+        if (activateError)
+        {
+            Thread.Sleep(1500);
+        }
+
+        var layoutResult = ApplyLayout(profile.Layout);
+        LogDiagnostic($"ApplyNamedProfile layout result={layoutResult} activateError={activateError}");
+
+        if (layoutResult == DISP_CHANGE_SUCCESSFUL && WaitForActiveTargets(profile.Targets))
+        {
+            return string.Format(Properties.Resources.activated_displays_format, profile.Targets.Count);
+        }
+
+        return activateError
+            ? activateResult
+            : string.Format(Properties.Resources.error_format, GetWin32ErrorMessage(layoutResult));
     }
 
     public static void DeleteSavedProfile(string fileName)
@@ -1522,17 +1772,13 @@ internal static partial class DisplayHelpers
             return null;
         }
 
-        var json = System.IO.File.ReadAllText(path);
-        using var doc = JsonDocument.Parse(json);
-        var name = doc.RootElement.GetProperty("Name").GetString();
-        var targetsElement = doc.RootElement.GetProperty("Targets");
-        var targets = System.Text.Json.JsonSerializer.Deserialize<List<DisplayTargetId>>(targetsElement.GetRawText());
-        if (string.IsNullOrEmpty(name) || targets == null || targets.Count == 0)
+        var profile = JsonSerializer.Deserialize<SavedProfile>(System.IO.File.ReadAllText(path));
+        if (profile == null || string.IsNullOrEmpty(profile.Name) || profile.Targets.Count == 0)
         {
             return null;
         }
 
-        return (name, targets);
+        return (profile.Name, profile.Targets);
     }
 
     public static string OverwriteNamedProfile(string fileName, string name, List<DisplayTargetId> targets)
@@ -1549,9 +1795,18 @@ internal static partial class DisplayHelpers
         }
 
         var path = System.IO.Path.Combine(ProfilesDir, $"{safeName}.json");
-        var data = new { Name = name, Targets = targets };
+        var data = new SavedProfile
+        {
+            Name = name,
+            Targets = targets,
+            Layout = CaptureLayout(targets),
+        };
         System.IO.File.WriteAllText(path, System.Text.Json.JsonSerializer.Serialize(data));
-        SaveSnapshot();
+        if (!string.Equals(path, System.IO.Path.Combine(ProfilesDir, fileName), StringComparison.OrdinalIgnoreCase))
+        {
+            System.IO.File.Delete(System.IO.Path.Combine(ProfilesDir, fileName));
+        }
+
         return Properties.Resources.profile_saved;
     }
 

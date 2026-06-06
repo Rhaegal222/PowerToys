@@ -1,52 +1,38 @@
 <Project>
-  <!--
-    This .targets file bypasses XAML compilation by:
-    1. Removing all Page and ApplicationDefinition items (so XamlCompiler.exe never runs)
-    2. Adding pre-existing generated .g.cs /.g.i.cs files from the last successful build
-       as Compile items, so the C# code + XAML code-behind compile together.
-    3. Adding .xaml files as Content items so they are copied to the output directory
-       (the corresponding .xbf files from the last successful build are expected to already
-        exist in the output directory).
-  -->
-
-  <!-- Clear XAML items early, before the XAML compilation targets check @(Page) -->
+  <!-- Removes all XAML-page items so the XAML compiler targets see empty collections
+       and are skipped entirely.  The .g.cs / .g.i.cs / .xbf files from the last
+       successful XAML compilation are re-used instead. -->
   <ItemGroup>
-    <Page Remove="**\*.xaml" />
-    <ApplicationDefinition Remove="**\*.xaml" />
+    <Page Remove="@(Page)" />
+    <ApplicationDefinition Remove="@(ApplicationDefinition)" />
   </ItemGroup>
 
-  <!--
-    Re-add .xaml files as Content so they get copied to the output directory.
-    The .xbf files from the previous successful build are already in output\.
-  -->
+  <!-- Pre-generated XAML code-behind.  Searches recursively so that
+       sub-folders in obj/x64/Debug (e.g. Controls/, Pages/, Settings/) are
+       picked up automatically.  Exclude the 0-byte XamlTypeInfo.g.cs so the
+       compiler doesn't try to feed that to the C# compiler. -->
   <ItemGroup>
-    <Content Include="**\*.xaml" Exclude="$(DefaultItemExcludes);$(DefaultExcludesInProjectFolder)" />
+    <Compile Include="obj\$(Platform)\$(Configuration)\**\*.g.cs"
+             Exclude="obj\$(Platform)\$(Configuration)\XamlTypeInfo.g.cs" />
+    <Compile Include="obj\$(Platform)\$(Configuration)\**\*.g.i.cs" />
   </ItemGroup>
 
-  <!-- Include all existing generated code-behind files from the previous build -->
+  <!-- XBF files already sitting in the output directory from a prior build.
+       Include as content so they stay deployed next to the .dll / .exe.
+       Note: the glob will be empty if $(OutputPath) hasn't been set yet;
+       MSBuild evaluates it lazily. -->
   <ItemGroup>
-    <Compile Include="$(IntermediateOutputPath)App.g.cs" />
-    <Compile Include="$(IntermediateOutputPath)App.g.i.cs" />
-    <Compile Include="$(IntermediateOutputPath)MainWindow.g.cs" />
-    <Compile Include="$(IntermediateOutputPath)MainWindow.g.i.cs" />
-    <Compile Include="$(IntermediateOutputPath)ToastWindow.g.cs" />
-    <Compile Include="$(IntermediateOutputPath)ToastWindow.g.i.cs" />
-    <Compile Include="$(IntermediateOutputPath)XamlTypeInfo.g.cs" />
-    <Compile Include="$(IntermediateOutputPath)Controls\*.g.cs" />
-    <Compile Include="$(IntermediateOutputPath)Controls\*.g.i.cs" />
-    <Compile Include="$(IntermediateOutputPath)Dock\*.g.cs" />
-    <Compile Include="$(IntermediateOutputPath)Dock\*.g.i.cs" />
-    <Compile Include="$(IntermediateOutputPath)ExtViews\*.g.cs" />
-    <Compile Include="$(IntermediateOutputPath)ExtViews\*.g.i.cs" />
-    <Compile Include="$(IntermediateOutputPath)ExtViews\Controls\*.g.cs" />
-    <Compile Include="$(IntermediateOutputPath)ExtViews\Controls\*.g.i.cs" />
-    <Compile Include="$(IntermediateOutputPath)Pages\*.g.cs" />
-    <Compile Include="$(IntermediateOutputPath)Pages\*.g.i.cs" />
-    <Compile Include="$(IntermediateOutputPath)Settings\*.g.cs" />
-    <Compile Include="$(IntermediateOutputPath)Settings\*.g.i.cs" />
-    <Compile Include="$(IntermediateOutputPath)Styles\*.g.cs" />
-    <Compile Include="$(IntermediateOutputPath)Styles\*.g.i.cs" />
-    <Compile Include="$(IntermediateOutputPath)Controls\ShortcutControl\*.g.cs" />
-    <Compile Include="$(IntermediateOutputPath)Controls\ShortcutControl\*.g.i.cs" />
+    <Content Include="$(OutputPath)**\*.xbf" />
   </ItemGroup>
+
+  <!-- Ensure the generated code-behind files are recognized as inputs
+       so incremental builds don't skip CoreCompile. -->
+  <PropertyGroup>
+    <CustomAdditionalCompileInputs>
+      $(CustomAdditionalCompileInputs);
+      obj\$(Platform)\$(Configuration)\**\*.g.cs;
+      obj\$(Platform)\$(Configuration)\**\*.g.i.cs;
+    </CustomAdditionalCompileInputs>
+  </PropertyGroup>
+
 </Project>

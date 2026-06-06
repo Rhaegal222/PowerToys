@@ -25,6 +25,10 @@
     <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
       <_Parameter1>Microsoft.CmdPal.UI</_Parameter1>
     </AssemblyAttribute>
+    <!-- Test runner project -->
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>MonitorPowerExtension.Tests</_Parameter1>
+    </AssemblyAttribute>
   </ItemGroup>
 
   <ItemGroup>
