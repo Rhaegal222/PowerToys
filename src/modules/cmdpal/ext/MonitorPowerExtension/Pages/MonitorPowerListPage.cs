@@ -87,11 +87,34 @@ public sealed partial class MonitorPowerListPage : ListPage
 
         public override CommandResult Invoke()
         {
-            var msg = DisplayHelpers.ApplyNamedProfile(_fileName);
-            var isError = msg.StartsWith(Resources.error_prefix, StringComparison.OrdinalIgnoreCase);
             ExtensionHost.ShowStatus(
-                new StatusMessage() { Message = msg, State = isError ? MessageState.Error : MessageState.Success },
+                new StatusMessage() { Message = "Attivazione profilo in corso... Attendi l'accensione dei monitor.", State = MessageState.Info },
                 StatusContext.Extension);
+
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                try
+                {
+                    var msg = DisplayHelpers.ApplyNamedProfile(_fileName, (progressMsg, state) =>
+                    {
+                        ExtensionHost.ShowStatus(
+                            new StatusMessage() { Message = progressMsg, State = state },
+                            StatusContext.Extension);
+                    });
+
+                    var isError = msg.StartsWith(Resources.error_prefix, StringComparison.OrdinalIgnoreCase);
+                    ExtensionHost.ShowStatus(
+                        new StatusMessage() { Message = msg, State = isError ? MessageState.Error : MessageState.Success },
+                        StatusContext.Extension);
+                }
+                catch (Exception ex)
+                {
+                    ExtensionHost.ShowStatus(
+                        new StatusMessage() { Message = "Errore: " + ex.Message, State = MessageState.Error },
+                        StatusContext.Extension);
+                }
+            });
+
             return CommandResult.KeepOpen();
         }
     }

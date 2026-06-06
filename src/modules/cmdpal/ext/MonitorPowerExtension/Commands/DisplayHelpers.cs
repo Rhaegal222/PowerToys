@@ -10,6 +10,7 @@ using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
+using Microsoft.CommandPalette.Extensions;
 
 #pragma warning disable IL2026, IL3050
 
@@ -359,6 +360,7 @@ internal static partial class DisplayHelpers
     private const uint CDS_SET_PRIMARY = 0x10;
     private const uint CDS_NORESET = 0x10000000;
     private const uint ENUM_REGISTRY_SETTINGS = 0xFFFFFFFE;
+    private const uint ENUM_CURRENT_SETTINGS = 0xFFFFFFFF;
     private const int DISP_CHANGE_SUCCESSFUL = 0;
     private const int DM_POSITION = 0x00000020;
     private const int DM_DISPLAYORIENTATION = 0x00000080;
@@ -1092,7 +1094,7 @@ internal static partial class DisplayHelpers
         return DISPLAYCONFIG_TOPOLOGY_ID.Extend;
     }
 
-    public static string ActivateDisplays(List<DisplayTargetId> targets)
+    public static string ActivateDisplays(List<DisplayTargetId> targets, Action<string, MessageState>? onProgress = null)
     {
         SaveState();
         SaveSnapshot();
@@ -1102,7 +1104,7 @@ internal static partial class DisplayHelpers
         // manageState:false — SaveState() already called above; must not null _savedState on failure.
         var result = SetTopology(topology, manageState: false);
         if (!result.StartsWith(Properties.Resources.error_prefix, StringComparison.OrdinalIgnoreCase) &&
-            WaitForActiveTargets(targets))
+            WaitForActiveTargets(targets, onProgress: onProgress))
         {
             return string.Format(Properties.Resources.activated_displays_format, targets.Count);
         }
@@ -1156,7 +1158,7 @@ internal static partial class DisplayHelpers
 
         if (err == 0)
         {
-            if (WaitForActiveTargets(targets))
+            if (WaitForActiveTargets(targets, onProgress: onProgress))
             {
                 EnableEscRestore();
                 return string.Format(Properties.Resources.activated_displays_format, targets.Count);
@@ -1165,7 +1167,7 @@ internal static partial class DisplayHelpers
 
         // CDSE fallback for builds where SetDisplayConfig returns ERROR_INVALID_PARAMETER
         int cdseResult = TryActivateViaCDSE(targets);
-        if (cdseResult == DISP_CHANGE_SUCCESSFUL && WaitForActiveTargets(targets))
+        if (cdseResult == DISP_CHANGE_SUCCESSFUL && WaitForActiveTargets(targets, onProgress: onProgress))
         {
             EnableEscRestore();
             return string.Format(Properties.Resources.activated_displays_format, targets.Count);
@@ -1175,9 +1177,7 @@ internal static partial class DisplayHelpers
         return string.Format(Properties.Resources.error_format, GetWin32ErrorMessage(err));
     }
 
-    // maxWaitMs: total ms to wait for all monitors to report as active.
-    // Physical monitors waking from sleep/off can take 5-10 s; default 15 s.
-    private static bool WaitForActiveTargets(List<DisplayTargetId> targets, int maxWaitMs = 15000)
+    private static bool WaitForActiveTargets(List<DisplayTargetId> targets, int maxWaitMs = 15000, Action<string, MessageState>? onProgress = null)
     {
         var requested = targets.ToHashSet();
         const int pollMs = 500;
@@ -1191,6 +1191,12 @@ internal static partial class DisplayHelpers
             if (active.SetEquals(requested))
             {
                 return true;
+            }
+
+            if (onProgress != null)
+            {
+                int remainingSecs = (maxWaitMs - elapsed + 999) / 1000;
+                onProgress.Invoke($"Verifica monitor attivi in corso ({remainingSecs}s)...", MessageState.Info);
             }
 
             Thread.Sleep(pollMs);
@@ -1236,7 +1242,7 @@ internal static partial class DisplayHelpers
             deviceName ??= string.Empty;
             var dm = default(DEVMODE);
             dm.dmSize = (short)Marshal.SizeOf<DEVMODE>();
-            int regOk = string.IsNullOrEmpty(deviceName) ? 0 : EnumDisplaySettings(deviceName, ENUM_REGISTRY_SETTINGS, ref dm);
+            int regOk = string.IsNullOrEmpty(deviceName) ? 0 : EnumDisplaySettings(deviceName, ENUM_CURRENT_SETTINGS, ref dm);
             targets.Add(new SnapshotTarget
             {
                 LowPart = id.AdapterId.LowPart,
@@ -1508,7 +1514,7 @@ internal static partial class DisplayHelpers
 
             var dm = default(DEVMODE);
             dm.dmSize = (short)Marshal.SizeOf<DEVMODE>();
-            if (EnumDisplaySettings(deviceName, ENUM_REGISTRY_SETTINGS, ref dm) == 0 ||
+            if (EnumDisplaySettings(deviceName, ENUM_CURRENT_SETTINGS, ref dm) == 0 ||
                 dm.dmPelsWidth == 0 ||
                 dm.dmPelsHeight == 0)
             {
@@ -1542,12 +1548,49 @@ internal static partial class DisplayHelpers
             return DISP_CHANGE_SUCCESSFUL;
         }
 
+        // Pass 1: Apply orientation and resolution/frequency settings
+        foreach (var entry in layout)
+        {
+            if (string.IsNullOrWhiteSpace(entry.DeviceName) || entry.Width <= 0 || entry.Height <= 0)
+            {
+                continue;
+            }
+
+            var dm = default(DEVMODE);
+            dm.dmSize = (short)Marshal.SizeOf<DEVMODE>();
+            _ = EnumDisplaySettings(entry.DeviceName, ENUM_CURRENT_SETTINGS, ref dm);
+            dm.dmFields = DM_DISPLAYORIENTATION |
+                          DM_PELSWIDTH |
+                          DM_PELSHEIGHT |
+                          DM_DISPLAYFREQUENCY |
+                          DM_BITSPERPEL;
+            dm.dmDisplayOrientation = entry.Orientation;
+            dm.dmPelsWidth = entry.Width;
+            dm.dmPelsHeight = entry.Height;
+            dm.dmDisplayFrequency = entry.Frequency;
+            dm.dmBitsPerPel = entry.BitsPerPel;
+
+            var dmPtr = Marshal.AllocHGlobal(Marshal.SizeOf<DEVMODE>());
+            try
+            {
+                Marshal.StructureToPtr(dm, dmPtr, false);
+                var flags = CDS_UPDATEREGISTRY | CDS_GLOBAL | CDS_NORESET;
+                _ = ChangeDisplaySettingsEx(entry.DeviceName, dmPtr, nint.Zero, flags, nint.Zero);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(dmPtr);
+            }
+        }
+
+        _ = ChangeDisplaySettingsEx(null!, nint.Zero, nint.Zero, 0, nint.Zero);
+        Thread.Sleep(500); // Give the system a brief moment to apply the rotation
+
+        // Pass 2: Apply positions
         var result = DISP_CHANGE_SUCCESSFUL;
         foreach (var entry in layout)
         {
-            if (string.IsNullOrWhiteSpace(entry.DeviceName) ||
-                entry.Width <= 0 ||
-                entry.Height <= 0)
+            if (string.IsNullOrWhiteSpace(entry.DeviceName) || entry.Width <= 0 || entry.Height <= 0)
             {
                 result = -1;
                 continue;
@@ -1555,33 +1598,23 @@ internal static partial class DisplayHelpers
 
             var dm = default(DEVMODE);
             dm.dmSize = (short)Marshal.SizeOf<DEVMODE>();
-            _ = EnumDisplaySettings(entry.DeviceName, ENUM_REGISTRY_SETTINGS, ref dm);
-            dm.dmFields = DM_POSITION |
-                          DM_DISPLAYORIENTATION |
-                          DM_BITSPERPEL |
-                          DM_PELSWIDTH |
-                          DM_PELSHEIGHT |
-                          DM_DISPLAYFREQUENCY;
+            _ = EnumDisplaySettings(entry.DeviceName, ENUM_CURRENT_SETTINGS, ref dm);
+            dm.dmFields = DM_POSITION;
             dm.dmPositionX = entry.PositionX;
             dm.dmPositionY = entry.PositionY;
-            dm.dmDisplayOrientation = entry.Orientation;
-            dm.dmBitsPerPel = entry.BitsPerPel;
-            dm.dmPelsWidth = entry.Width;
-            dm.dmPelsHeight = entry.Height;
-            dm.dmDisplayFrequency = entry.Frequency;
 
             var dmPtr = Marshal.AllocHGlobal(Marshal.SizeOf<DEVMODE>());
             try
             {
                 Marshal.StructureToPtr(dm, dmPtr, false);
-                var flags = CDS_UPDATEREGISTRY | CDS_NORESET;
+                var flags = CDS_UPDATEREGISTRY | CDS_GLOBAL | CDS_NORESET;
                 if (entry.IsPrimary)
                 {
                     flags |= CDS_SET_PRIMARY;
                 }
 
                 var applyResult = ChangeDisplaySettingsEx(entry.DeviceName, dmPtr, nint.Zero, flags, nint.Zero);
-                LogDiagnostic($"CDSE layout {entry.DeviceName} {entry.Width}x{entry.Height}@{entry.Frequency} pos=({entry.PositionX},{entry.PositionY}) orientation={entry.Orientation} result={applyResult}");
+                LogDiagnostic($"CDSE position {entry.DeviceName} pos=({entry.PositionX},{entry.PositionY}) result={applyResult}");
                 if (applyResult != DISP_CHANGE_SUCCESSFUL)
                 {
                     result = applyResult;
@@ -1594,7 +1627,7 @@ internal static partial class DisplayHelpers
         }
 
         var commitResult = ChangeDisplaySettingsEx(null!, nint.Zero, nint.Zero, 0, nint.Zero);
-        LogDiagnostic($"CDSE layout commit result={commitResult}");
+        LogDiagnostic($"CDSE position commit result={commitResult}");
         return commitResult == DISP_CHANGE_SUCCESSFUL ? result : commitResult;
     }
 
@@ -1707,7 +1740,7 @@ internal static partial class DisplayHelpers
         return list;
     }
 
-    public static string ApplyNamedProfile(string fileName)
+    public static string ApplyNamedProfile(string fileName, Action<string, MessageState>? onProgress = null)
     {
         var path = System.IO.Path.Combine(ProfilesDir, fileName);
         if (!System.IO.File.Exists(path))
@@ -1721,7 +1754,7 @@ internal static partial class DisplayHelpers
             return string.Format(Properties.Resources.error_format, Properties.Resources.error_profile_empty);
         }
 
-        var activateResult = ActivateDisplays(profile.Targets);
+        var activateResult = ActivateDisplays(profile.Targets, onProgress);
 
         // Always attempt ApplyLayout when a layout is available.
         // When switching from a single-display topology (e.g. TV-only) back to
@@ -1732,14 +1765,31 @@ internal static partial class DisplayHelpers
         bool activateError = activateResult.StartsWith(
             Properties.Resources.error_prefix, StringComparison.OrdinalIgnoreCase);
 
+        var activePaths = GetActivePaths().paths;
+        bool enablingMonitors = activePaths.Length < profile.Targets.Count;
+
         if (profile.Layout == null || profile.Layout.Count == 0)
         {
             return activateResult;
         }
 
-        if (activateError)
+        if (enablingMonitors)
         {
-            Thread.Sleep(1500);
+            // Give DP monitors sufficient time to wake up, complete link training
+            // and expose display modes before applying the layout (resolution/orientation).
+            for (int i = 3; i > 0; i--)
+            {
+                onProgress?.Invoke($"Attivazione profilo in corso... Attendi l'accensione dei monitor ({i}s)...", MessageState.Info);
+                Thread.Sleep(1000);
+            }
+        }
+        else if (activateError)
+        {
+            for (int i = 2; i > 0; i--)
+            {
+                onProgress?.Invoke($"Attivazione profilo in corso... Attendi ({i}s)...", MessageState.Info);
+                Thread.Sleep(750);
+            }
         }
 
         var layoutResult = ApplyLayout(profile.Layout);
