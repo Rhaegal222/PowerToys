@@ -5,6 +5,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.InteropServices;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using MonitorPowerExtension;
 using static MonitorPowerExtension.DisplayHelpers;
@@ -16,6 +17,26 @@ public class DisplayHelpersTests
 {
     private static DisplayTargetId MakeTarget(uint adapterLow, uint targetId) =>
         new(new LUID { LowPart = adapterLow }, targetId);
+
+    [TestMethod]
+    public void DisplayConfigPathStructs_MatchNativeLayoutSizes()
+    {
+        Assert.AreEqual(20, Marshal.SizeOf<DISPLAYCONFIG_PATH_SOURCE_INFO>());
+        Assert.AreEqual(48, Marshal.SizeOf<DISPLAYCONFIG_PATH_TARGET_INFO>());
+        Assert.AreEqual(72, Marshal.SizeOf<DISPLAYCONFIG_PATH_INFO>());
+    }
+
+    [TestMethod]
+    public void DisplayConfigPathStructs_VirtualModeIndexesShareModeInfoIdxStorage()
+    {
+        var source = new DISPLAYCONFIG_PATH_SOURCE_INFO { modeInfoIdx = 0x12345678 };
+        var target = new DISPLAYCONFIG_PATH_TARGET_INFO { modeInfoIdx = 0x9ABCDEF0 };
+
+        Assert.AreEqual(0x5678, source.cloneGroupId);
+        Assert.AreEqual(0x1234, source.sourceModeInfoIdx);
+        Assert.AreEqual(0xDEF0, target.desktopModeInfoIdx);
+        Assert.AreEqual(0x9ABC, target.targetModeInfoIdx);
+    }
 
     [TestMethod]
     public void ClassifyTopology_SingleExternalDisplay_ReturnsExternal()
@@ -135,6 +156,66 @@ public class DisplayHelpersTests
 
         Assert.IsNotNull(result);
         Assert.IsTrue(result.Length > 0);
+    }
+
+    [TestMethod]
+    public void ResolveSavedProfileFileName_ProfileName_ReturnsFileName()
+    {
+        var profileName = "unit-test-reference-" + Guid.NewGuid().ToString("N")[..8];
+        var targets = new List<DisplayTargetId> { MakeTarget(1, 1) };
+        string? fileToDelete = null;
+
+        try
+        {
+            SaveNamedProfile(profileName, targets);
+            var profiles = GetSavedProfiles();
+            fileToDelete = profiles.FirstOrDefault(p => p.Name == profileName).FileName;
+
+            var result = ResolveSavedProfileFileName(profileName, referenceIsFileName: false);
+
+            Assert.AreEqual(fileToDelete, result);
+        }
+        finally
+        {
+            if (fileToDelete is not null)
+            {
+                DeleteSavedProfile(fileToDelete);
+            }
+        }
+    }
+
+    [TestMethod]
+    public void ResolveSavedProfileFileName_FileName_ReturnsFileName()
+    {
+        var profileName = "unit-test-file-reference-" + Guid.NewGuid().ToString("N")[..8];
+        var targets = new List<DisplayTargetId> { MakeTarget(1, 1) };
+        string? fileToDelete = null;
+
+        try
+        {
+            SaveNamedProfile(profileName, targets);
+            var profiles = GetSavedProfiles();
+            fileToDelete = profiles.FirstOrDefault(p => p.Name == profileName).FileName;
+
+            var result = ResolveSavedProfileFileName(fileToDelete, referenceIsFileName: true);
+
+            Assert.AreEqual(fileToDelete, result);
+        }
+        finally
+        {
+            if (fileToDelete is not null)
+            {
+                DeleteSavedProfile(fileToDelete);
+            }
+        }
+    }
+
+    [TestMethod]
+    public void ResolveSavedProfileFileName_FileNameWithPath_ReturnsNull()
+    {
+        var result = ResolveSavedProfileFileName(@"folder\profile.json", referenceIsFileName: true);
+
+        Assert.IsNull(result);
     }
 
     [TestMethod]

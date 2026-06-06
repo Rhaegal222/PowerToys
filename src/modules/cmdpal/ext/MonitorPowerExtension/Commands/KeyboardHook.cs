@@ -14,10 +14,9 @@ internal sealed partial class KeyboardHook : IDisposable
     private const int HookTypeKeyboardLowLevel = 13;
     private const int WmKeydown = 0x0100;
     private const int VkEscape = 0x1B;
-    private const int VkGamebar = 0x93;
 
     private readonly LowLevelKeyboardProc _proc;
-    private readonly Dictionary<int, Action> _keyActions = [];
+    private readonly Dictionary<int, Func<bool>> _keyActions = [];
     private nint _hookId = nint.Zero;
     private Thread? _hookThread;
     private CancellationTokenSource? _cts;
@@ -37,14 +36,11 @@ internal sealed partial class KeyboardHook : IDisposable
     public static KeyboardHook CreateWithEsc(Action onEsc)
     {
         var hook = new KeyboardHook();
-        hook._keyActions[VkEscape] = onEsc;
-        return hook;
-    }
-
-    public static KeyboardHook CreateWithXbox(Action onXbox)
-    {
-        var hook = new KeyboardHook();
-        hook._keyActions[VkGamebar] = onXbox;
+        hook._keyActions[VkEscape] = () =>
+        {
+            onEsc();
+            return true;
+        };
         return hook;
     }
 
@@ -52,7 +48,19 @@ internal sealed partial class KeyboardHook : IDisposable
     {
         lock (_keyActions)
         {
-            _keyActions[vkCode] = action;
+            _keyActions[vkCode] = () =>
+            {
+                action();
+                return true;
+            };
+        }
+    }
+
+    public void RegisterConditional(int vkCode, Func<bool> handler)
+    {
+        lock (_keyActions)
+        {
+            _keyActions[vkCode] = handler;
         }
     }
 
@@ -105,9 +113,8 @@ internal sealed partial class KeyboardHook : IDisposable
             var vkCode = Marshal.ReadInt32(lParam);
             lock (_keyActions)
             {
-                if (_keyActions.TryGetValue(vkCode, out var action))
+                if (_keyActions.TryGetValue(vkCode, out var handler) && handler())
                 {
-                    action();
                     return (nint)1;
                 }
             }

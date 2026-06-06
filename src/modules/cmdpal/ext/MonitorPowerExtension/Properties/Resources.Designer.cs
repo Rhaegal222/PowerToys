@@ -157,5 +157,9 @@ namespace MonitorPowerExtension.Properties
         public static string delete_profile_title => ResourceManager.GetString("delete_profile_title", resourceCulture);
 
         public static string profile_deleted => ResourceManager.GetString("profile_deleted", resourceCulture);
+
+        public static string edit_profile_title => ResourceManager.GetString("edit_profile_title", resourceCulture);
+
+        public static string edit_profile_page_title => ResourceManager.GetString("edit_profile_page_title", resourceCulture);
     }
 }

@@ -215,4 +215,10 @@
   <data name="profile_deleted" xml:space="preserve">
     <value>Profile deleted</value>
   </data>
+  <data name="edit_profile_title" xml:space="preserve">
+    <value>Edit profile</value>
+  </data>
+  <data name="edit_profile_page_title" xml:space="preserve">
+    <value>Edit profile</value>
+  </data>
 </root>

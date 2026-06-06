@@ -100,6 +100,7 @@ public sealed partial class MainWindow : WindowEx,
 
     private bool _preventHideWhenDeactivated;
     private bool _isLoadedFromDock;
+    private CancellationTokenSource? _monitorPowerApplyGuardCts;
 
     private DevRibbon? _devRibbon;
 
@@ -164,6 +165,16 @@ public sealed partial class MainWindow : WindowEx,
         WeakReferenceMessenger.Default.Register<DragCompletedMessage>(this);
         WeakReferenceMessenger.Default.Register<ToggleDevRibbonMessage>(this);
         WeakReferenceMessenger.Default.Register<GetHwndMessage>(this);
+
+        MonitorPowerExtension.DisplayHelpers.GuideViewComboPressed += () =>
+        {
+            DispatcherQueue.TryEnqueue(() =>
+            {
+                Summon(MonitorPowerExtension.Pages.MonitorPowerListPage.MonitorPowerListPageId);
+            });
+        };
+        MonitorPowerExtension.DisplayHelpers.DisplayProfileApplyStarted += BeginMonitorPowerDisplayChangeGuard;
+        MonitorPowerExtension.DisplayHelpers.DisplayProfileApplyCompleted += EndMonitorPowerDisplayChangeGuard;
 
         // Hide our titlebar.
         // We need to both ExtendsContentIntoTitleBar, then set the height to Collapsed
@@ -1101,6 +1112,10 @@ public sealed partial class MainWindow : WindowEx,
 
                             return;
                         }
+                        else if (TryHandleMonitorPowerProtocolUri(uri))
+                        {
+                            return;
+                        }
                     }
                 }
             }
@@ -1130,6 +1145,68 @@ public sealed partial class MainWindow : WindowEx,
         }
 
         Summon(string.Empty);
+    }
+
+    private bool TryHandleMonitorPowerProtocolUri(string uriText)
+    {
+        if (!Uri.TryCreate(uriText, UriKind.Absolute, out var uri) ||
+            !string.Equals(uri.Scheme, "x-cmdpal", StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(uri.Host, "monitorpower", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var path = uri.AbsolutePath.TrimEnd('/');
+        if (string.IsNullOrEmpty(path))
+        {
+            Summon(MonitorPowerExtension.Pages.MonitorPowerListPage.MonitorPowerListPageId);
+            return true;
+        }
+
+        if (!string.Equals(path, "/apply", StringComparison.OrdinalIgnoreCase))
+        {
+            Summon(MonitorPowerExtension.Pages.MonitorPowerListPage.MonitorPowerListPageId);
+            return true;
+        }
+
+        var fileName = GetQueryParameter(uri.Query, "file");
+        var profileName = GetQueryParameter(uri.Query, "profile");
+        var referenceIsFileName = !string.IsNullOrWhiteSpace(fileName);
+        var profileReference = referenceIsFileName ? fileName : profileName;
+
+        Summon(MonitorPowerExtension.Pages.MonitorPowerListPage.MonitorPowerListPageId);
+        if (string.IsNullOrWhiteSpace(profileReference))
+        {
+            Logger.LogWarning("MonitorPower protocol apply command ignored because no profile reference was provided.");
+            return true;
+        }
+
+        var result = MonitorPowerExtension.DisplayHelpers.ApplySavedProfileReference(profileReference, referenceIsFileName);
+        Logger.LogInfo($"MonitorPower protocol apply command completed: {result}");
+        return true;
+    }
+
+    private static string? GetQueryParameter(string query, string name)
+    {
+        if (string.IsNullOrEmpty(query))
+        {
+            return null;
+        }
+
+        var trimmedQuery = query[0] == '?' ? query[1..] : query;
+        foreach (var pair in trimmedQuery.Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var parts = pair.Split('=', 2);
+            var key = Uri.UnescapeDataString(parts[0].Replace("+", " ", StringComparison.Ordinal));
+            if (!string.Equals(key, name, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            return parts.Length == 2 ? Uri.UnescapeDataString(parts[1].Replace("+", " ", StringComparison.Ordinal)) : string.Empty;
+        }
+
+        return null;
     }
 
     public void Summon(string commandId) =>
@@ -1385,6 +1462,40 @@ public sealed partial class MainWindow : WindowEx,
         });
     }
 
+    private void BeginMonitorPowerDisplayChangeGuard()
+    {
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            _monitorPowerApplyGuardCts?.Cancel();
+            _monitorPowerApplyGuardCts?.Dispose();
+            _monitorPowerApplyGuardCts = null;
+            _preventHideWhenDeactivated = true;
+            StopAutoGoHome();
+        });
+    }
+
+    private void EndMonitorPowerDisplayChangeGuard()
+    {
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            _monitorPowerApplyGuardCts?.Cancel();
+            _monitorPowerApplyGuardCts?.Dispose();
+            _monitorPowerApplyGuardCts = new CancellationTokenSource();
+            var token = _monitorPowerApplyGuardCts.Token;
+            Action<Task> continuation = _ =>
+            {
+                if (!token.IsCancellationRequested)
+                {
+                    DispatcherQueue.TryEnqueue(() =>
+                    {
+                        _preventHideWhenDeactivated = false;
+                    });
+                }
+            };
+            Task.Delay(1500, token).ContinueWith(continuation, TaskScheduler.Default);
+        });
+    }
+
     private unsafe void StealForeground()
     {
         var foregroundWindow = PInvoke.GetForegroundWindow();
@@ -1393,10 +1504,6 @@ public sealed partial class MainWindow : WindowEx,
             return;
         }
 
-        // This is bad, evil, and I'll have to forgo today's dinner dessert to punish myself
-        // for  writing this. But there's no way to make this work without it.
-        // If the window is not reactivated, the UX breaks down: a deactivated window has to
-        // be activated and then deactivated again to hide.
         var currentThreadId = PInvoke.GetCurrentThreadId();
         var foregroundThreadId = PInvoke.GetWindowThreadProcessId(foregroundWindow, null);
         if (foregroundThreadId != currentThreadId)

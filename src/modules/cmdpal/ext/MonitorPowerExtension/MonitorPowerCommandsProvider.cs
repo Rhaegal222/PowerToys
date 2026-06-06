@@ -25,6 +25,8 @@ public partial class MonitorPowerCommandsProvider : CommandProvider
             Subtitle = Resources.provider_subtitle,
             Icon = Icon,
         };
+
+        DisplayHelpers.EnableXboxGuideViewCombo();
     }
 
     public override ICommandItem[] TopLevelCommands() => [_pageItem];

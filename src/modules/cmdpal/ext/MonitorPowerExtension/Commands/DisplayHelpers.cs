@@ -9,10 +9,11 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading;
 
 #pragma warning disable IL2026, IL3050
 
-#pragma warning disable SA1307, SA1310, SA1316, SA1649, CA1069, CA1305, CA1863
+#pragma warning disable SA1300, SA1307, SA1310, SA1316, SA1649, CA1069, CA1305, CA1863
 
 namespace MonitorPowerExtension;
 
@@ -39,8 +40,12 @@ internal struct DISPLAYCONFIG_PATH_SOURCE_INFO
     public LUID adapterId;
     public uint id;
     public uint modeInfoIdx;
-    public uint cloneGroupId;
     public uint statusFlags;
+
+    // Virtual-mode-aware sub-fields of modeInfoIdx
+    public readonly ushort cloneGroupId => (ushort)(modeInfoIdx & 0xFFFF);
+
+    public readonly ushort sourceModeInfoIdx => (ushort)(modeInfoIdx >> 16);
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -66,6 +71,11 @@ internal struct DISPLAYCONFIG_PATH_TARGET_INFO
     public DISPLAYCONFIG_SCANLINE_ORDERING scanlineOrdering;
     public int targetAvailable;
     public uint statusFlags;
+
+    // Virtual-mode-aware sub-fields of modeInfoIdx
+    public readonly ushort desktopModeInfoIdx => (ushort)(modeInfoIdx & 0xFFFF);
+
+    public readonly ushort targetModeInfoIdx => (ushort)(modeInfoIdx >> 16);
 }
 
 internal enum DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY : uint
@@ -285,11 +295,20 @@ internal static partial class DisplayHelpers
     private static readonly object StateLock = new();
     private static (DISPLAYCONFIG_PATH_INFO[] paths, DISPLAYCONFIG_MODE_INFO[] modes)? _savedState;
     private static KeyboardHook? _activeHook;
-    private const int XboxTripleClickMs = 1200;
-    private static int _xboxTapCount;
-    private static DateTime _xboxFirstTap;
     private static Dictionary<DisplayTargetId, string>? _displayNameCache;
     private static DisplayTargetId[]? _cachedTargetOrder;
+    private static Timer? _xboxPollTimer;
+    private static bool _guideWasPressed;
+
+    public static event Action? GuideViewComboPressed;
+
+    public static event Action? DisplayProfileApplyStarted;
+
+    public static event Action? DisplayProfileApplyCompleted;
+
+    private const ushort XinputGamepadBack = 0x0020;
+    private const ushort XinputGamepadGuide = 0x0400;
+    private const int XinputMaxControllers = 4;
 
     internal const DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY INTERNAL_TECH = (DISPLAYCONFIG_VIDEO_OUTPUT_TECHNOLOGY)0x80000000;
 
@@ -327,6 +346,56 @@ internal static partial class DisplayHelpers
 
     [DllImport("user32.dll", EntryPoint = "DisplayConfigGetDeviceInfo")]
     private static extern int DisplayConfigGetDeviceInfo_IntPtr(IntPtr requestPacket);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int ChangeDisplaySettingsEx(string lpszDeviceName, IntPtr lpDevMode, IntPtr hwnd, uint dwFlags, IntPtr lParam);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int EnumDisplaySettings(string lpszDeviceName, uint iModeNum, ref DEVMODE lpDevMode);
+
+    private const uint CDS_UPDATEREGISTRY = 0x01;
+    private const uint CDS_GLOBAL = 0x08;
+    private const uint CDS_ENABLE = 0x04;
+    private const uint CDS_NORESET = 0x10000000;
+    private const uint ENUM_REGISTRY_SETTINGS = 0xFFFFFFFE;
+    private const int DISP_CHANGE_SUCCESSFUL = 0;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct DEVMODE
+    {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+        public string dmDeviceName;
+        public short dmSpecVersion;
+        public short dmDriverVersion;
+        public short dmSize;
+        public short dmDriverExtra;
+        public int dmFields;
+        public int dmPositionX;
+        public int dmPositionY;
+        public int dmDisplayOrientation;
+        public int dmDisplayFixedOutput;
+        public short dmColor;
+        public short dmDuplex;
+        public short dmYResolution;
+        public short dmTTOption;
+        public short dmCollate;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+        public string dmFormName;
+        public short dmLogPixels;
+        public int dmBitsPerPel;
+        public int dmPelsWidth;
+        public int dmPelsHeight;
+        public int dmDisplayFlags;
+        public int dmDisplayFrequency;
+        public int dmICMMethod;
+        public int dmICMIntent;
+        public int dmMediaType;
+        public int dmDitherType;
+        public int dmReserved1;
+        public int dmReserved2;
+        public int dmPanningWidth;
+        public int dmPanningHeight;
+    }
 
     private const uint DIGCF_PRESENT = 0x00000002;
     private const uint DIGCF_PROFILE = 0x00000008;
@@ -497,13 +566,15 @@ internal static partial class DisplayHelpers
             {
                 _displayNameCache[uniqueTargets[i].Item1] = setupApiNames[i];
             }
-
-            return;
         }
 
-        foreach (var (id, _) in uniqueTargets)
+        for (int i = 0; i < uniqueTargets.Count; i++)
         {
-            _displayNameCache[id] = string.Format(Properties.Resources.display_label, _displayNameCache.Count + 1);
+            var id = uniqueTargets[i].Item1;
+            if (!_displayNameCache.ContainsKey(id))
+            {
+                _displayNameCache[id] = string.Format(Properties.Resources.display_label, i + 1);
+            }
         }
     }
 
@@ -782,59 +853,97 @@ internal static partial class DisplayHelpers
         }
     }
 
-    public static void EnableXboxTripleClick()
+    public static void EnableXboxGuideViewCombo()
     {
         lock (StateLock)
         {
-            _xboxTapCount = 0;
-
-            if (_activeHook != null)
+            if (_xboxPollTimer != null)
             {
-                _activeHook.Register(0x93, OnXboxTap);
                 return;
             }
 
-            _activeHook = KeyboardHook.CreateWithXbox(OnXboxTap);
+            _guideWasPressed = false;
+            _xboxPollTimer = new Timer(
+                _ => PollXboxGuide(),
+                null,
+                0,
+                100);
         }
     }
 
-    private static void OnXboxTap()
+    public static void DisableXboxGuideViewCombo()
     {
-        var now = DateTime.UtcNow;
         lock (StateLock)
         {
-            if (_xboxTapCount == 0 || (now - _xboxFirstTap).TotalMilliseconds > XboxTripleClickMs)
-            {
-                _xboxTapCount = 1;
-                _xboxFirstTap = now;
-                return;
-            }
-
-            _xboxTapCount++;
-            if (_xboxTapCount >= 3)
-            {
-                _xboxTapCount = 0;
-                CycleTopology();
-            }
+            _xboxPollTimer?.Dispose();
+            _xboxPollTimer = null;
         }
     }
 
-    private static readonly DISPLAYCONFIG_TOPOLOGY_ID[] TopologyCycle =
-    [
-        DISPLAYCONFIG_TOPOLOGY_ID.Extend,
-        DISPLAYCONFIG_TOPOLOGY_ID.External,
-        DISPLAYCONFIG_TOPOLOGY_ID.Internal,
-        DISPLAYCONFIG_TOPOLOGY_ID.Clone,
-    ];
-
-    private static int _topologyCycleIndex;
-
-    private static void CycleTopology()
+    private static void PollXboxGuide()
     {
-        var topology = TopologyCycle[_topologyCycleIndex % TopologyCycle.Length];
-        _topologyCycleIndex++;
-        var msg = SetTopology(topology);
-        System.Diagnostics.Debug.WriteLine($"Xbox triple-click: {msg}");
+        // Try all 4 controller indices
+        for (int userIndex = 0; userIndex < XinputMaxControllers; userIndex++)
+        {
+            var state = default(XINPUT_STATE);
+            if (XInputGetState(userIndex, ref state) != 0)
+            {
+                continue;
+            }
+
+            bool guideDown = (state.Gamepad.wButtons & XinputGamepadGuide) != 0;
+            bool viewDown = (state.Gamepad.wButtons & XinputGamepadBack) != 0;
+
+            if (guideDown && !_guideWasPressed)
+            {
+                _guideWasPressed = true;
+
+                if (viewDown)
+                {
+                    CycleSavedProfiles();
+                    GuideViewComboPressed?.Invoke();
+                }
+
+                return;
+            }
+
+            _guideWasPressed = guideDown;
+            return;
+        }
+
+        _guideWasPressed = false;
+    }
+
+    private static int _profileCycleIndex;
+
+    private static void CycleSavedProfiles()
+    {
+        var profiles = GetSavedProfiles();
+        if (profiles.Count == 0)
+        {
+            System.Diagnostics.Debug.WriteLine("Xbox Guide+View: no saved profiles to cycle");
+            return;
+        }
+
+        _profileCycleIndex %= profiles.Count;
+        var (fileName, name) = profiles[_profileCycleIndex];
+        _profileCycleIndex++;
+        var msg = ApplySavedProfileReference(fileName, referenceIsFileName: true);
+        System.Diagnostics.Debug.WriteLine($"Xbox Guide+View applied profile '{name}': {msg}");
+    }
+
+    private static bool IsViewButtonPressed()
+    {
+        for (int i = 0; i < XinputMaxControllers; i++)
+        {
+            var state = default(XINPUT_STATE);
+            if (XInputGetState(i, ref state) == 0 && (state.Gamepad.wButtons & XinputGamepadBack) != 0)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     public static bool TryActivateDisplays(List<DisplayTargetId> targets, out string message)
@@ -1020,6 +1129,16 @@ internal static partial class DisplayHelpers
         if (err == 0)
         {
             EnableEscRestore();
+            SaveSnapshot();
+            return string.Format(Properties.Resources.activated_displays_format, targets.Count);
+        }
+
+        // CDSE fallback for builds where SetDisplayConfig returns ERROR_INVALID_PARAMETER
+        int cdseResult = TryActivateViaCDSE(targets);
+        if (cdseResult == DISP_CHANGE_SUCCESSFUL)
+        {
+            EnableEscRestore();
+            SaveSnapshot();
             return string.Format(Properties.Resources.activated_displays_format, targets.Count);
         }
 
@@ -1032,10 +1151,290 @@ internal static partial class DisplayHelpers
         "MonitorPowerExtension",
         "profiles");
 
+    private static readonly string SnapshotDir = System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "MonitorPowerExtension");
+
+    private static readonly string SnapshotPath = System.IO.Path.Combine(SnapshotDir, "snapshot.json");
+
+    internal static void SaveSnapshot()
+    {
+        var (paths, _) = GetActivePaths();
+        var deviceNameMap = BuildTargetToDeviceNameMap();
+        var targets = new List<SnapshotTarget>();
+        foreach (var p in paths)
+        {
+            var id = new DisplayTargetId(p.targetInfo.adapterId, p.targetInfo.id);
+            deviceNameMap.TryGetValue(id, out var deviceName);
+            deviceName ??= string.Empty;
+            var dm = default(DEVMODE);
+            dm.dmSize = (short)Marshal.SizeOf<DEVMODE>();
+            int regOk = string.IsNullOrEmpty(deviceName) ? 0 : EnumDisplaySettings(deviceName, ENUM_REGISTRY_SETTINGS, ref dm);
+            targets.Add(new SnapshotTarget
+            {
+                LowPart = id.AdapterId.LowPart,
+                HighPart = id.AdapterId.HighPart,
+                TargetId = id.TargetId,
+                DeviceName = deviceName,
+                Width = regOk != 0 ? dm.dmPelsWidth : 0,
+                Height = regOk != 0 ? dm.dmPelsHeight : 0,
+                Frequency = regOk != 0 ? dm.dmDisplayFrequency : 0,
+                PositionX = regOk != 0 ? dm.dmPositionX : 0,
+                PositionY = regOk != 0 ? dm.dmPositionY : 0,
+                Orientation = regOk != 0 ? dm.dmDisplayOrientation : 0,
+                BitsPerPel = regOk != 0 ? dm.dmBitsPerPel : 0,
+            });
+        }
+
+        if (!Directory.Exists(SnapshotDir))
+        {
+            Directory.CreateDirectory(SnapshotDir);
+        }
+
+        File.WriteAllText(SnapshotPath, JsonSerializer.Serialize(new { targets }));
+    }
+
+    private sealed class SnapshotTarget
+    {
+        public uint LowPart { get; set; }
+
+        public int HighPart { get; set; }
+
+        public uint TargetId { get; set; }
+
+        public string DeviceName { get; set; } = string.Empty;
+
+        public int Width { get; set; }
+
+        public int Height { get; set; }
+
+        public int Frequency { get; set; }
+
+        public int PositionX { get; set; }
+
+        public int PositionY { get; set; }
+
+        public int Orientation { get; set; }
+
+        public int BitsPerPel { get; set; }
+    }
+
+    // Build a map from DisplayTargetId → GDI device name by walking all paths and
+    // using the *source* id (not the target id) for GetSourceName.
+    private static Dictionary<DisplayTargetId, string> BuildTargetToDeviceNameMap()
+    {
+        var map = new Dictionary<DisplayTargetId, string>();
+        uint qflags = QDC_ALL_PATHS | QDC_VIRTUAL_MODE_AWARE;
+        int hr = GetDisplayConfigBufferSizes(qflags, out var np, out var nm);
+        if (hr != 0)
+        {
+            return map;
+        }
+
+        var pa = new DISPLAYCONFIG_PATH_INFO[np];
+        var ma = new DISPLAYCONFIG_MODE_INFO[nm];
+        unsafe
+        {
+            fixed (DISPLAYCONFIG_PATH_INFO* pp = pa)
+            {
+                fixed (DISPLAYCONFIG_MODE_INFO* mm = ma)
+                {
+                    hr = QueryDisplayConfig(qflags, ref np, pp, ref nm, mm, nint.Zero);
+                    if (hr != 0)
+                    {
+                        return map;
+                    }
+                }
+            }
+        }
+
+        Array.Resize(ref pa, (int)np);
+        foreach (var p in pa)
+        {
+            var targetId = new DisplayTargetId(p.targetInfo.adapterId, p.targetInfo.id);
+            if (map.ContainsKey(targetId))
+            {
+                continue;
+            }
+
+            // GetSourceName requires the *source* id from sourceInfo — not the target id.
+            unsafe
+            {
+                var srcName = new DISPLAYCONFIG_SOURCE_DEVICE_NAME
+                {
+                    header = new DISPLAYCONFIG_DEVICE_INFO_HEADER
+                    {
+                        type = DISPLAYCONFIG_DEVICE_INFO_TYPE.GetSourceName,
+                        size = (uint)sizeof(DISPLAYCONFIG_SOURCE_DEVICE_NAME),
+                        adapterId = p.sourceInfo.adapterId,
+                        id = p.sourceInfo.id,
+                    },
+                };
+                DISPLAYCONFIG_SOURCE_DEVICE_NAME* ptr = &srcName;
+                int nameHr = DisplayConfigGetDeviceInfo_IntPtr((nint)ptr);
+                if (nameHr == 0)
+                {
+                    var gdiName = srcName.GetViewGdiDeviceName();
+                    if (!string.IsNullOrEmpty(gdiName))
+                    {
+                        map[targetId] = gdiName;
+                        continue;
+                    }
+                }
+            }
+
+            // Fallback: no usable name found for this target
+        }
+
+        return map;
+    }
+
+    private static unsafe int TryActivateViaCDSE(List<DisplayTargetId>? targetsToActivate = null)
+    {
+        // Build target → GDI device name map using correct source IDs
+        var targetToDevice = BuildTargetToDeviceNameMap();
+        if (targetToDevice.Count == 0)
+        {
+            return -1;
+        }
+
+        var activateSet = targetsToActivate != null
+            ? new HashSet<DisplayTargetId>(targetsToActivate)
+            : null;
+
+        // First, disable monitors NOT in the requested set (pass null DEVMODE)
+        if (activateSet != null)
+        {
+            foreach (var kvp in targetToDevice)
+            {
+                if (activateSet.Contains(kvp.Key))
+                {
+                    continue;
+                }
+
+                var deviceName = kvp.Value;
+                if (!deviceName.StartsWith(@"\\.\DISPLAY", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                // Disable this monitor by passing null DEVMODE with CDS_UPDATEREGISTRY | CDS_GLOBAL
+                _ = ChangeDisplaySettingsEx(deviceName, nint.Zero, nint.Zero, CDS_UPDATEREGISTRY | CDS_GLOBAL | CDS_NORESET, nint.Zero);
+            }
+        }
+
+        // Then activate each requested target
+        foreach (var target in targetToDevice)
+        {
+            if (activateSet != null && !activateSet.Contains(target.Key))
+            {
+                continue;
+            }
+
+            var deviceName = target.Value;
+            if (!deviceName.StartsWith(@"\\.\DISPLAY", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var dm = default(DEVMODE);
+            dm.dmSize = (short)Marshal.SizeOf<DEVMODE>();
+            int regOk = EnumDisplaySettings(deviceName, ENUM_REGISTRY_SETTINGS, ref dm);
+            if (regOk == 0 || dm.dmPelsWidth == 0 || dm.dmPelsHeight == 0)
+            {
+                // Try CDS_ENABLE as a last resort
+                int enableHr = ChangeDisplaySettingsEx(
+                    deviceName, nint.Zero, nint.Zero, CDS_ENABLE | CDS_NORESET, nint.Zero);
+                if (enableHr != DISP_CHANGE_SUCCESSFUL)
+                {
+                    _ = ChangeDisplaySettingsEx(
+                        deviceName, nint.Zero, nint.Zero, CDS_UPDATEREGISTRY | CDS_GLOBAL | CDS_NORESET, nint.Zero);
+                }
+
+                continue;
+            }
+
+            // Apply the registry settings with NORESET so we can commit all at once
+            int size = Marshal.SizeOf<DEVMODE>();
+            nint dmPtr = Marshal.AllocHGlobal(size);
+            try
+            {
+                Marshal.StructureToPtr(dm, dmPtr, false);
+                int result = ChangeDisplaySettingsEx(
+                    deviceName, dmPtr, nint.Zero, CDS_UPDATEREGISTRY | CDS_GLOBAL | CDS_NORESET, nint.Zero);
+                if (result != DISP_CHANGE_SUCCESSFUL)
+                {
+                    _ = ChangeDisplaySettingsEx(deviceName, dmPtr, nint.Zero, CDS_GLOBAL | CDS_NORESET, nint.Zero);
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(dmPtr);
+            }
+        }
+
+        // Commit all deferred changes at once
+        _ = ChangeDisplaySettingsEx(null!, nint.Zero, nint.Zero, 0, nint.Zero);
+
+        SaveSnapshot();
+        return DISP_CHANGE_SUCCESSFUL;
+    }
+
     private static string SanitizeFileName(string name)
     {
         var invalid = System.IO.Path.GetInvalidFileNameChars();
         return new string(name.Where(c => !invalid.Contains(c)).ToArray());
+    }
+
+    public static string? ResolveSavedProfileFileName(string profileReference, bool referenceIsFileName)
+    {
+        if (referenceIsFileName)
+        {
+            // Reject any input that contains path separators to prevent directory traversal
+            if (profileReference.Contains(System.IO.Path.DirectorySeparatorChar) ||
+                profileReference.Contains(System.IO.Path.AltDirectorySeparatorChar))
+            {
+                return null;
+            }
+
+            var name = System.IO.Path.GetFileNameWithoutExtension(profileReference);
+            if (string.IsNullOrEmpty(name))
+            {
+                return null;
+            }
+
+            return $"{name}.json";
+        }
+
+        var profiles = GetSavedProfiles();
+        foreach (var (fileName, pName) in profiles)
+        {
+            if (string.Equals(pName, profileReference, StringComparison.OrdinalIgnoreCase))
+            {
+                return fileName;
+            }
+        }
+
+        return null;
+    }
+
+    public static string ApplySavedProfileReference(string profileReference, bool referenceIsFileName)
+    {
+        var fileName = ResolveSavedProfileFileName(profileReference, referenceIsFileName);
+        if (fileName == null)
+        {
+            return string.Format(Properties.Resources.error_format, Properties.Resources.error_profile_not_found);
+        }
+
+        DisplayProfileApplyStarted?.Invoke();
+        try
+        {
+            return ApplyNamedProfile(fileName);
+        }
+        finally
+        {
+            DisplayProfileApplyCompleted?.Invoke();
+        }
     }
 
     public static string SaveNamedProfile(string name, List<DisplayTargetId> targets)
@@ -1054,6 +1453,7 @@ internal static partial class DisplayHelpers
         var path = System.IO.Path.Combine(ProfilesDir, $"{safeName}.json");
         var data = new { Name = name, Targets = targets };
         System.IO.File.WriteAllText(path, System.Text.Json.JsonSerializer.Serialize(data));
+        SaveSnapshot();
         return Properties.Resources.profile_saved;
     }
 
@@ -1113,4 +1513,67 @@ internal static partial class DisplayHelpers
             System.IO.File.Delete(path);
         }
     }
+
+    public static (string Name, List<DisplayTargetId> Targets)? LoadNamedProfile(string fileName)
+    {
+        var path = System.IO.Path.Combine(ProfilesDir, fileName);
+        if (!System.IO.File.Exists(path))
+        {
+            return null;
+        }
+
+        var json = System.IO.File.ReadAllText(path);
+        using var doc = JsonDocument.Parse(json);
+        var name = doc.RootElement.GetProperty("Name").GetString();
+        var targetsElement = doc.RootElement.GetProperty("Targets");
+        var targets = System.Text.Json.JsonSerializer.Deserialize<List<DisplayTargetId>>(targetsElement.GetRawText());
+        if (string.IsNullOrEmpty(name) || targets == null || targets.Count == 0)
+        {
+            return null;
+        }
+
+        return (name, targets);
+    }
+
+    public static string OverwriteNamedProfile(string fileName, string name, List<DisplayTargetId> targets)
+    {
+        if (targets.Count == 0)
+        {
+            return string.Format(Properties.Resources.error_format, Properties.Resources.error_no_displays_selected);
+        }
+
+        var safeName = SanitizeFileName(name);
+        if (!System.IO.Directory.Exists(ProfilesDir))
+        {
+            System.IO.Directory.CreateDirectory(ProfilesDir);
+        }
+
+        var path = System.IO.Path.Combine(ProfilesDir, $"{safeName}.json");
+        var data = new { Name = name, Targets = targets };
+        System.IO.File.WriteAllText(path, System.Text.Json.JsonSerializer.Serialize(data));
+        SaveSnapshot();
+        return Properties.Resources.profile_saved;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct XINPUT_STATE
+    {
+        public uint dwPacketNumber;
+        public XINPUT_GAMEPAD Gamepad;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct XINPUT_GAMEPAD
+    {
+        public ushort wButtons;
+        public byte bLeftTrigger;
+        public byte bRightTrigger;
+        public short sThumbLX;
+        public short sThumbLY;
+        public short sThumbRX;
+        public short sThumbRY;
+    }
+
+    [DllImport("xinput1_4.dll", EntryPoint = "XInputGetState")]
+    private static extern int XInputGetState(int dwUserIndex, ref XINPUT_STATE pState);
 }

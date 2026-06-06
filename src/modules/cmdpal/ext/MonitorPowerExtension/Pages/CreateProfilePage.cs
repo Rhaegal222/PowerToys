@@ -15,14 +15,33 @@ namespace MonitorPowerExtension.Pages;
 
 internal sealed partial class CreateProfilePage : DynamicListPage
 {
+    private readonly MonitorPowerListPage? _parentPage;
     private readonly List<TargetState> _targets;
+    private readonly string? _existingFileName;
 
     public CreateProfilePage()
+        : this(null)
     {
+    }
+
+    public CreateProfilePage(MonitorPowerListPage? parentPage)
+    {
+        _parentPage = parentPage;
         Name = Resources.create_profile_page_title;
         Title = Resources.create_profile_page_title;
         PlaceholderText = Resources.profile_name_placeholder;
         _targets = LoadTargets();
+    }
+
+    public CreateProfilePage(MonitorPowerListPage? parentPage, string existingFileName, string existingName, List<DisplayHelpers.DisplayTargetId> existingTargets)
+    {
+        _parentPage = parentPage;
+        Name = Resources.edit_profile_page_title;
+        Title = Resources.edit_profile_page_title;
+        PlaceholderText = Resources.profile_name_placeholder;
+        _existingFileName = existingFileName;
+        SearchText = existingName;
+        _targets = LoadTargets(existingTargets);
     }
 
     public override void UpdateSearchText(string oldSearch, string newSearch) => RaiseItemsChanged(0);
@@ -60,23 +79,55 @@ internal sealed partial class CreateProfilePage : DynamicListPage
         return [.. items];
     }
 
-    private static List<TargetState> LoadTargets()
+    private List<TargetState> LoadTargets(List<DisplayHelpers.DisplayTargetId>? preSelected = null)
     {
         try
         {
-            var activeTargets = DisplayHelpers.GetActivePaths().paths
+            var preselectedSet = preSelected != null
+                ? new HashSet<DisplayHelpers.DisplayTargetId>(preSelected)
+                : DisplayHelpers.GetActivePaths().paths
+                    .Select(p => new DisplayHelpers.DisplayTargetId(p.targetInfo.adapterId, p.targetInfo.id))
+                    .ToHashSet();
+
+            // Collect named targets: include those flagged targetAvailable AND all currently-active
+            // paths. On Windows Insider builds QDC_ALL_PATHS may report targetAvailable==0 for
+            // monitors that are physically active, so we union both sets.
+            var activeIds = DisplayHelpers.GetActivePaths().paths
                 .Select(p => new DisplayHelpers.DisplayTargetId(p.targetInfo.adapterId, p.targetInfo.id))
                 .ToHashSet();
 
-            return DisplayHelpers.GetAllPaths()
+            var candidates = DisplayHelpers.GetAllPaths()
+                .Where(p => p.targetInfo.targetAvailable != 0 ||
+                            activeIds.Contains(new DisplayHelpers.DisplayTargetId(p.targetInfo.adapterId, p.targetInfo.id)))
                 .GroupBy(p => new DisplayHelpers.DisplayTargetId(p.targetInfo.adapterId, p.targetInfo.id))
                 .Select(g =>
                 {
                     var path = g.First();
                     var id = new DisplayHelpers.DisplayTargetId(path.targetInfo.adapterId, path.targetInfo.id);
-                    return new TargetState(id, GetTargetName(path.targetInfo), activeTargets.Contains(id));
+                    var name = GetTargetName(path.targetInfo);
+                    return (id, name, keepOn: preselectedSet.Contains(id));
                 })
+                .Where(t => !string.IsNullOrEmpty(t.name) && t.name != Resources.unknown_display)
                 .ToList();
+
+            // Disambiguate when the same physical name appears on multiple target IDs
+            var nameCounts = candidates.GroupBy(t => t.name).ToDictionary(g => g.Key, g => g.Count());
+            var nameIndexes = new Dictionary<string, int>();
+            var result = new List<TargetState>(candidates.Count);
+            foreach (var t in candidates)
+            {
+                var finalName = t.name;
+                if (nameCounts[t.name] > 1)
+                {
+                    nameIndexes.TryGetValue(t.name, out var idx);
+                    nameIndexes[t.name] = idx + 1;
+                    finalName = $"{t.name} #{idx + 1}";
+                }
+
+                result.Add(new TargetState(t.id, finalName, t.keepOn));
+            }
+
+            return result;
         }
         catch
         {
@@ -121,12 +172,32 @@ internal sealed partial class CreateProfilePage : DynamicListPage
 
         try
         {
-            var msg = DisplayHelpers.SaveNamedProfile(name, selectedTargets);
-            var isError = msg.StartsWith(Resources.error_prefix, StringComparison.OrdinalIgnoreCase);
+            if (_existingFileName != null)
+            {
+                var msg = DisplayHelpers.OverwriteNamedProfile(_existingFileName, name, selectedTargets);
+                var isError = msg.StartsWith(Resources.error_prefix, StringComparison.OrdinalIgnoreCase);
+                ExtensionHost.ShowStatus(
+                    new StatusMessage() { Message = msg, State = isError ? MessageState.Error : MessageState.Success },
+                    StatusContext.Extension);
+                if (!isError)
+                {
+                    _parentPage?.RefreshProfiles();
+                }
+
+                return isError ? CommandResult.KeepOpen() : CommandResult.GoBack();
+            }
+
+            var msg2 = DisplayHelpers.SaveNamedProfile(name, selectedTargets);
+            var isError2 = msg2.StartsWith(Resources.error_prefix, StringComparison.OrdinalIgnoreCase);
             ExtensionHost.ShowStatus(
-                new StatusMessage() { Message = msg, State = isError ? MessageState.Error : MessageState.Success },
+                new StatusMessage() { Message = msg2, State = isError2 ? MessageState.Error : MessageState.Success },
                 StatusContext.Extension);
-            return isError ? CommandResult.KeepOpen() : CommandResult.GoHome();
+            if (!isError2)
+            {
+                _parentPage?.RefreshProfiles();
+            }
+
+            return isError2 ? CommandResult.KeepOpen() : CommandResult.GoBack();
         }
         catch (Exception ex)
         {
