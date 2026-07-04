@@ -110,6 +110,10 @@ internal sealed partial class CreateProfilePage : DynamicListPage
                 .Where(t => !string.IsNullOrEmpty(t.name) && t.name != Resources.unknown_display)
                 .ToList();
 
+            // Filter out ghost targets (Intel GPU) that share a GDI device name
+            var deviceNameMap = DisplayHelpers.BuildTargetToDeviceNameMap();
+            candidates = candidates.Where(t => deviceNameMap.ContainsKey(t.id)).ToList();
+
             // Disambiguate when the same physical name appears on multiple target IDs
             var nameCounts = candidates.GroupBy(t => t.name).ToDictionary(g => g.Key, g => g.Count());
             var nameIndexes = new Dictionary<string, int>();
